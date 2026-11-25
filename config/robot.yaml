@@ -14,9 +14,13 @@ arm:
   joint_limits_deg: {}
 
 tool:
-  # Parallel-gripper fingers are longer than the stock jaw in the URDF. Provisional value from
-  # pose B (model tip 3.4 cm above the table while the real tip touched it); confirm by measurement.
-  tip_extension_m: 0.034
+  # Fingertip centre (jaws closed) in the gripper_link frame, from the parallel gripper CAD
+  # (assets/so101/assets/parallel_gripper). Agrees with pose B (tip touching the table: 13.2 cm).
+  # The URDF's stock tool point sits 8 mm off the wrist-roll axis; the parallel jaws close on it.
+  tip_xyz_m: [0.0, 0.0, -0.1318]
+  # Gap between the jaws at 100 % opening (range_min tick 2260): 1760 ticks on a ~8.5 mm pitch-radius
+  # pinion, both clamps moving. Estimate from the CAD gear; measure to confirm.
+  gripper_open_gap_m: 0.046
 
 # Allowed grasp/target region in the base frame (m). +x forward, +y = arm's left, z = 0 is the table.
 # Every perception-derived target is checked against this before the arm moves.

@@ -202,7 +202,7 @@ def main() -> None:
             "camera": {"device": cfg.camera_device, "width": cfg.camera_width, "height": cfg.camera_height},
             "arm_calibration": {k: asdict(v) for k, v in load_calibration(cfg.calibration_file).items()},
             "joint_offsets_deg": cfg.joint_offsets_deg,
-            "tip_extension_m": cfg.tip_extension_m,
+            "tip_xyz_m": cfg.tip_xyz_m,
             "robot_yaml": (CONFIG_DIR / "robot.yaml").read_text(),
             "plan": views_to_json(views),
             "frames": [],

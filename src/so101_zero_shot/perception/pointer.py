@@ -97,3 +97,52 @@ class VlmPointer:
             out = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
         text = self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
         return parse_pointing(text, w, h)
+
+    def _ask(self, image_rgb: np.ndarray, prompt: str, max_new_tokens: int = 24) -> str:
+        from PIL import Image
+
+        messages = [{"role": "user", "content": [
+            {"type": "image", "image": Image.fromarray(image_rgb)}, {"type": "text", "text": prompt}]}]
+        inputs = self.processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
+        ).to(self.device)
+        with self.torch.inference_mode():
+            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        return self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+
+    def describe(self, image_rgb: np.ndarray, mask: np.ndarray) -> str:
+        """Short name of the masked object (e.g. "black dry erase marker")."""
+        return clean_name(self._ask(describe_crop(image_rgb, mask), DESCRIBE_PROMPT))
+
+
+# No example names: the 2B model copies them when unsure.
+DESCRIBE_PROMPT = ("Name the object outlined in red, in 2 to 6 words (its color and what it is). "
+                   "Answer with the name only.")
+
+
+def describe_crop(image_rgb: np.ndarray, mask: np.ndarray, pad_frac: float = 0.6, min_side: int = 160) -> np.ndarray:
+    """Crop around the mask (with context) and outline the mask in red: what the VLM is asked to name."""
+    import cv2
+
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        raise ValueError("empty mask")
+    h, w = mask.shape
+    cx, cy = (xs.min() + xs.max()) / 2, (ys.min() + ys.max()) / 2
+    side = max(xs.max() - xs.min(), ys.max() - ys.min()) * (1 + 2 * pad_frac)
+    side = max(side, min_side)
+    x0, x1 = int(max(0, cx - side / 2)), int(min(w, cx + side / 2))
+    y0, y1 = int(max(0, cy - side / 2)), int(min(h, cy + side / 2))
+    out = image_rgb.copy()
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(out, contours, -1, (255, 0, 0), 2)  # RGB red
+    return out[y0:y1, x0:x1]
+
+
+def clean_name(text: str, max_words: int = 8) -> str:
+    """First line of the answer, without quotes, trailing period or a leading article."""
+    line = (text.strip().splitlines() or [""])[0].strip().strip('"\'` .').strip()
+    words = line.split()
+    if words and words[0].lower() in ("a", "an", "the"):
+        words = words[1:]
+    return " ".join(words[:max_words]) or "unknown object"

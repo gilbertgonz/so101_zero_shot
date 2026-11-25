@@ -1,11 +1,14 @@
 """Perception geometry with fake models: a box on the table must come back at the right place and height."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from so101_zero_shot.config import RobotConfig
 from so101_zero_shot.perception.depth import DepthFitError, fit_table_scale
 from so101_zero_shot.perception.geometry import FisheyeCamera, Rectifier, table_depth, to_base
+from so101_zero_shot.perception.gripper_mask import GRIPPER_VIEW_PATH, GripperMask, load_gripper_view
 from so101_zero_shot.perception.locate import Locator, PerceptionError
 from so101_zero_shot.perception.pointer import Pointing, parse_pointing
 
@@ -90,6 +93,48 @@ def test_locates_box(scene, noise):
     (x0, x1), (y0, y1) = BOX_XY
     assert est.center_base[:2] == pytest.approx([(x0 + x1) / 2, (y0 + y1) / 2], abs=0.004)
     assert est.top_z_m == pytest.approx(BOX_H, abs=0.004 + 0.1 * noise)
+
+
+
+def _gripper(mask):
+    return GripperMask({p: mask for p in range(0, 101, GripperMask.STEP_PCT)})
+
+
+def test_object_on_gripper_rejected(scene):
+    cfg, kin, cam, rect, q, Z, on_box = scene
+    loc = Locator(cam, kin, FakePointer(on_box), FakeSegmenter(on_box), FakeDepth(Z), rectifier=rect,
+                  gripper_mask=_gripper(on_box.copy()))
+    with pytest.raises(PerceptionError, match="own gripper"):
+        loc.locate(np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8), q, "box")
+
+
+def test_object_touching_gripper_kept_minus_gripper_pixels(scene):
+    """An object beside or partly behind the fingers is still an object; only the finger pixels go."""
+    cfg, kin, cam, rect, q, Z, on_box = scene
+    v, _ = np.nonzero(on_box)
+    g = np.zeros_like(on_box)
+    g[v.max() - 3:] = True  # gripper covers the box's bottom few rows and everything below
+    loc = Locator(cam, kin, FakePointer(on_box), FakeSegmenter(on_box), FakeDepth(Z), rectifier=rect,
+                  gripper_mask=_gripper(g))
+    est, _ = loc.locate(np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8), q, "box")
+    assert not (est.mask & g).any()
+    assert any("gripper" in w for w in est.warnings)
+    (x0, x1), (y0, y1) = BOX_XY
+    assert est.center_base[:2] == pytest.approx([(x0 + x1) / 2, (y0 + y1) / 2], abs=0.006)
+
+
+def test_rendered_gripper_mask_matches_real_view():
+    """Fitted gripper view: covers the fingertips (bottom centre of the straightened view) and the rods,
+    not the table beside the fingers where a cap was wrongly rejected (run grasp_20261125_131428)."""
+    if not Path(GRIPPER_VIEW_PATH).exists():
+        pytest.skip("gripper view not fitted")
+    rect = Rectifier(FisheyeCamera.load())
+    gm = GripperMask.render(load_gripper_view(), rect.K, rect.size)
+    closed, opened = gm.mask(0), gm.mask(100)
+    assert closed[450, 480] and closed[700, 480]  # between the fingertips' base / the rods
+    assert not closed[474, 217] and not closed[200, 480]  # the cap beside the left finger; the table ahead
+    assert 0.05 < closed.mean() < 0.3
+    assert (opened != closed).mean() > 0.01  # the clamps move
 
 
 def test_not_found_raises(scene):

@@ -1,5 +1,7 @@
 """SO101Arm motion logic against a fake bus (no hardware)."""
 
+import time
+
 import numpy as np
 import pytest
 
@@ -78,3 +80,32 @@ def test_offsets_and_gripper_inversion_roundtrip():
     arm.gripper_inverted = True
     assert arm.gripper_to_ticks(0.0) == CAL[GRIPPER].range_max  # closed = max ticks on the parallel gripper
     assert arm.gripper_to_ticks(150.0) == CAL[GRIPPER].range_min  # clamped: never past max safe open
+
+
+def test_request_stop_interrupts_a_move_and_holds():
+    import threading
+
+    from so101_zero_shot.hardware import MotionStopped
+
+    arm = make_arm(sag_ticks={})
+    target = np.array([0.0, -30.0, 10.0, 60.0, 0.0])
+    errors = []
+
+    def run():
+        try:
+            arm.move_to(target, speed_deg_s=30.0)  # ~1.4 s move
+        except MotionStopped as e:
+            errors.append(e)
+
+    t = threading.Thread(target=run)
+    t.start()
+    time.sleep(0.3)
+    arm.request_stop()
+    t.join(2.0)
+    assert not t.is_alive() and errors, "move did not stop"
+    assert np.max(np.abs(arm.read_joints() - target)) > 5.0  # stopped partway
+    with pytest.raises(MotionStopped):  # stays stopped until cleared
+        arm.move_to(target)
+    arm.clear_stop()
+    arm.move_to(target, speed_deg_s=200.0, compensate=False)
+    assert np.max(np.abs(arm.read_joints() - target)) < 1.0

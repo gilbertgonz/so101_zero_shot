@@ -12,6 +12,7 @@ import numpy as np
 from ..kinematics import TIP_FRAME, SO101Kinematics
 from .depth import DepthFitError, TableFit, fit_table_scale
 from .geometry import FisheyeCamera, Rectifier, table_depth, to_base
+from .gripper_mask import GripperMask
 from .pointer import Pointing
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,13 @@ logger = logging.getLogger(__name__)
 
 class PerceptionError(RuntimeError):
     pass
+
+
+MAX_MASK_FRAC = 0.25  # a "mask" bigger than this is the table / background, not a graspable object
+# Share of a mask on the robot's own gripper (rendered outline, grown by GRIPPER_GROW_PX for fit error)
+# above which the mask is the gripper itself, not an object.
+MAX_ON_GRIPPER_FRAC = 0.5
+GRIPPER_GROW_PX = 6
 
 
 class PointerModel(Protocol):
@@ -75,7 +83,12 @@ class Locator:
         table_z_m: float = 0.0,
         table_region_m: tuple[tuple[float, float], tuple[float, float]] = ((0.05, 0.40), (-0.25, 0.25)),
         gripper_margin_frac: float = 0.08,
+        gripper_mask: GripperMask | None = None,
+        fit_gripper_margin_px: int | None = 25,
     ):
+        """`gripper_mask`: where the robot's own gripper is in the image; without it, clicks/answers on
+        the gripper are not caught. With it, the depth fit leaves out the fingers plus
+        `fit_gripper_margin_px` around them (None: every row below the fingertips, the older rule)."""
         self.cam, self.kin = cam, kin
         self.pointer, self.segmenter, self.depth = pointer, segmenter, depth
         self.rect = rectifier or Rectifier(cam)
@@ -83,6 +96,17 @@ class Locator:
         self.table_z_m = table_z_m
         self.table_region_m = table_region_m
         self.gripper_margin_frac = gripper_margin_frac
+        self.gripper_mask = gripper_mask
+        self.fit_gripper_margin_px = fit_gripper_margin_px
+        if gripper_mask is None:
+            logger.warning("Locator without a gripper mask: masks on the robot's own fingers are not rejected")
+
+    def fingertip_row(self, joints_deg: np.ndarray, T_base_cam: np.ndarray) -> float | None:
+        """Image row of the fingertips (projected tip frame); the fingers fill the image below it."""
+        tip = np.linalg.inv(T_base_cam) @ self.kin.fk(joints_deg, TIP_FRAME)[:, 3]
+        if tip[2] <= 0:
+            return None
+        return float(self.rect.K[1, 1] * tip[1] / tip[2] + self.rect.K[1, 2])
 
     def gripper_row(self, joints_deg: np.ndarray, T_base_cam: np.ndarray) -> int | None:
         """First image row of the gripper's own fingers (they fill the bottom of the wrist camera's view).
@@ -91,33 +115,76 @@ class Locator:
         the lens, so the depth model spends most of its range on them and the table pixels between and
         beside them fit badly (measured: mug height 3 cm with them, 10.6 cm without).
         """
-        tip = np.linalg.inv(T_base_cam) @ self.kin.fk(joints_deg, TIP_FRAME)[:, 3]
-        if tip[2] <= 0:
+        v = self.fingertip_row(joints_deg, T_base_cam)
+        if v is None:
             return None
-        v = self.rect.K[1, 1] * tip[1] / tip[2] + self.rect.K[1, 2]
         row = int(v - self.gripper_margin_frac * self.rect.size[1])
         return row if 0 < row < self.rect.size[1] else None
 
-    def locate(self, fisheye_bgr: np.ndarray, joints_deg: np.ndarray, query: str) -> tuple[ObjectEstimate, dict]:
-        """Returns the estimate and debug arrays (rectified image, disparity, metric depth).
+    def _remove_gripper(self, mask: np.ndarray, gripper_pct: float, debug: dict, warnings: list[str]) -> np.ndarray:
+        """Reject a mask that is mostly the robot's own gripper; otherwise drop any gripper pixels from it."""
+        if self.gripper_mask is None:
+            return mask
+        g = self.gripper_mask.mask(gripper_pct)
+        if g.shape != mask.shape:
+            raise PerceptionError(f"gripper mask is {g.shape}, image mask {mask.shape}: rectifier mismatch")
+        k = 2 * GRIPPER_GROW_PX + 1
+        g = cv2.dilate(g.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+        debug["gripper_mask"] = g
+        on = float((mask & g).sum() / max(mask.sum(), 1))
+        if on > MAX_ON_GRIPPER_FRAC:
+            raise PerceptionError("that is the robot's own gripper, or something mostly hidden behind its "
+                                  "fingers; pick something else (or move the object out from under the fingers)")
+        if on > 0:
+            mask = mask & ~g
+            if mask.sum() < 50:
+                raise PerceptionError("almost all of that mask is on the gripper")
+            warnings.append(f"{on:.0%} of the mask was on the gripper and was dropped")
+        return mask
 
-        Raises PerceptionError if the object is not found or the geometry is unusable.
-        """
+    def locate(
+        self, fisheye_bgr: np.ndarray, joints_deg: np.ndarray, query: str, gripper_pct: float = 0.0,
+    ) -> tuple[ObjectEstimate, dict]:
+        """Find `query` with the VLM, then mask and measure it. Returns the estimate and debug arrays
+        (rectified image, disparity, metric depth). Raises PerceptionError if not found / unusable."""
         rect_bgr = self.rect.rectify(fisheye_bgr)
         rgb = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2RGB)
-        T = self.cam.pose_in_base(self.kin, joints_deg)
-        debug = {"rect_bgr": rect_bgr}
-
         pointing = self.pointer.point(rgb, query)
         if not pointing.found:
             raise PerceptionError(f"VLM did not find {query!r} (answer: {pointing.raw!r})")
+        return self._measure(rect_bgr, rgb, joints_deg, query, pointing, gripper_pct)
+
+    def locate_at(
+        self, fisheye_bgr: np.ndarray, joints_deg: np.ndarray, point_px: np.ndarray, box_px: np.ndarray | None = None,
+        label: str = "selected object", gripper_pct: float = 0.0,
+    ) -> tuple[ObjectEstimate, dict]:
+        """Mask and measure the object under `point_px` (rectified-image pixels), e.g. a user's click or
+        a previously located object projected into a new view. No VLM involved."""
+        rect_bgr = self.rect.rectify(fisheye_bgr)
+        rgb = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2RGB)
+        w, h = self.rect.size
+        point_px = np.asarray(point_px, dtype=float)
+        if not (0 <= point_px[0] < w and 0 <= point_px[1] < h):
+            raise PerceptionError(f"point {np.round(point_px)} is outside the image")
+        return self._measure(rect_bgr, rgb, joints_deg, label, Pointing(point_px, box_px, "point prompt"), gripper_pct)
+
+    def _measure(
+        self, rect_bgr: np.ndarray, rgb: np.ndarray, joints_deg: np.ndarray, query: str, pointing: Pointing,
+        gripper_pct: float = 0.0,
+    ) -> tuple[ObjectEstimate, dict]:
+        T = self.cam.pose_in_base(self.kin, joints_deg)
+        debug = {"rect_bgr": rect_bgr}
         mask, score = self.segmenter.mask(rgb, pointing.point_px, pointing.box_px)
         if mask.sum() < 50:
             raise PerceptionError(f"mask for {query!r} is empty ({mask.sum()} px)")
+        if mask.mean() > MAX_MASK_FRAC:
+            raise PerceptionError(f"the mask covers {mask.mean():.0%} of the image: that is the table or background, "
+                                  "not an object")
         warnings = []
+        mask = self._remove_gripper(mask, gripper_pct, debug, warnings)
         px, py = np.round(pointing.point_px).astype(int)
         if not mask[py, px]:
-            warnings.append("VLM point is outside the SAM mask")
+            warnings.append("point is outside the object mask")
 
         disp = self.depth.disparity(rgb)
         debug["disparity"] = disp
@@ -131,10 +198,18 @@ class Locator:
         grow = max(15, int(0.25 * np.sqrt(mask.sum())))
         near_obj = cv2.dilate(mask.astype(np.uint8), np.ones((2 * grow + 1, 2 * grow + 1), np.uint8)) > 0
         fit_mask = in_region & ~near_obj
-        row = self.gripper_row(joints_deg, T)
-        if row is not None:
-            fit_mask[row:] = False
-        debug["gripper_row"] = row
+        g = debug.get("gripper_mask")
+        if g is not None and self.fit_gripper_margin_px is not None:
+            # Leave out the fingers and a band around them (blur, depth bleeding off their edges) but keep
+            # the table beside them.
+            k = 2 * self.fit_gripper_margin_px + 1
+            fit_mask &= ~(cv2.dilate(g.astype(np.uint8), np.ones((k, k), np.uint8)) > 0)
+            debug["gripper_row"] = None
+        else:
+            row = self.gripper_row(joints_deg, T)
+            if row is not None:
+                fit_mask[row:] = False
+            debug["gripper_row"] = row
         try:
             fit = fit_table_scale(disp, tz, fit_mask)
         except DepthFitError as e:
@@ -177,6 +252,9 @@ def draw_debug(est: ObjectEstimate, debug: dict) -> np.ndarray:
     if est.pointing.box_px is not None:
         x1, y1, x2, y2 = est.pointing.box_px.astype(int)
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
+    if debug.get("gripper_mask") is not None:
+        cs, _ = cv2.findContours(debug["gripper_mask"].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(img, cs, -1, (255, 160, 0), 2)  # robot's own gripper
     cv2.drawMarker(img, tuple(est.pointing.point_px.astype(int)), (0, 0, 255), cv2.MARKER_CROSS, 24, 3)
     c = est.center_base * 100
     lines = [f'"{est.query}"', f"centre ({c[0]:.1f}, {c[1]:.1f}) cm  top {est.top_z_m * 100:.1f} cm",

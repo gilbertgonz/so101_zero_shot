@@ -30,24 +30,17 @@ class IKResult:
     success: bool
 
 
-def _urdf_with_tip_extension(urdf_path: Path, extension_m: float) -> Path:
-    """Copy of the URDF with the tip frame moved `extension_m` further out along the fingers."""
+def _urdf_with_tip(urdf_path: Path, tip_xyz_m: tuple[float, float, float]) -> Path:
+    """Copy of the URDF with the tip frame origin moved to `tip_xyz_m` (gripper_link frame); the tip
+    frame keeps its orientation (+z out of the fingers)."""
     tree = ET.parse(urdf_path)
     joint = tree.getroot().find("joint[@name='gripper_frame_joint']")
     origin = joint.find("origin") if joint is not None else None
     if origin is None:
-        raise ValueError(f"{urdf_path} has no gripper_frame_joint origin to extend")
-    xyz = np.array([float(v) for v in origin.get("xyz").split()])
-    rpy = [float(v) for v in origin.get("rpy").split()]
-    # Tip +z expressed in the parent (gripper_link) frame: R(rpy) @ [0, 0, 1].
-    r, p, y = rpy
-    Rx = np.array([[1, 0, 0], [0, np.cos(r), -np.sin(r)], [0, np.sin(r), np.cos(r)]])
-    Ry = np.array([[np.cos(p), 0, np.sin(p)], [0, 1, 0], [-np.sin(p), 0, np.cos(p)]])
-    Rz = np.array([[np.cos(y), -np.sin(y), 0], [np.sin(y), np.cos(y), 0], [0, 0, 1]])
-    xyz = xyz + (Rz @ Ry @ Rx)[:, 2] * extension_m
-    origin.set("xyz", " ".join(f"{v:.6g}" for v in xyz))
+        raise ValueError(f"{urdf_path} has no gripper_frame_joint origin to move")
+    origin.set("xyz", " ".join(f"{float(v):.6g}" for v in tip_xyz_m))
     # Mesh paths are relative to the URDF, so the patched copy must live next to it.
-    out = Path(tempfile.mkstemp(prefix=".tip_ext_", suffix=".urdf", dir=urdf_path.parent)[1])
+    out = Path(tempfile.mkstemp(prefix=".tip_", suffix=".urdf", dir=urdf_path.parent)[1])
     tree.write(out)
     return out
 
@@ -57,11 +50,13 @@ class SO101Kinematics:
         self,
         urdf_path: Path,
         joint_limits_deg: dict[str, tuple[float, float]] | None = None,
-        tip_extension_m: float = 0.0,
+        tip_xyz_m: tuple[float, float, float] | None = None,
     ):
-        """`tip_extension_m` lengthens the tool frame for fingers longer than the stock jaw."""
-        if tip_extension_m:
-            patched = _urdf_with_tip_extension(Path(urdf_path), tip_extension_m)
+        """`tip_xyz_m` replaces the URDF's (stock jaw) tool point, in the gripper_link frame."""
+        if tip_xyz_m is not None:
+            if len(tip_xyz_m) != 3:
+                raise ValueError(f"tip_xyz_m must have 3 values, got {tip_xyz_m}")
+            patched = _urdf_with_tip(Path(urdf_path), tip_xyz_m)
             try:
                 self.robot = placo.RobotWrapper(str(patched), placo.Flags.ignore_collisions)
             finally:

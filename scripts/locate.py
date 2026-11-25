@@ -24,6 +24,7 @@ import yaml
 from so101_zero_shot.config import CONFIG_DIR, RUNS_DIR, RobotConfig
 from so101_zero_shot.perception.depth import DepthAnything
 from so101_zero_shot.perception.geometry import FisheyeCamera, Rectifier
+from so101_zero_shot.perception.gripper_mask import GripperMask
 from so101_zero_shot.perception.locate import Locator, PerceptionError, draw_debug
 from so101_zero_shot.perception.pointer import VlmPointer
 from so101_zero_shot.perception.segment import Segmenter
@@ -69,6 +70,7 @@ def main() -> int:
         Segmenter(pcfg.get("sam_model", "facebook/sam2.1-hiera-small")),
         DepthAnything(pcfg.get("depth_model", "depth-anything/Depth-Anything-V2-Small-hf")),
         rectifier=rect, table_z_m=float(pcfg.get("table_z_m", 0.0)),
+        gripper_mask=GripperMask.load(rect.K, rect.size, cfg.gripper_open_gap_m),
     )
     print(f"models loaded in {time.monotonic() - t0:.0f} s")
     cv2.imwrite(str(d / "rectified.jpg"), rect.rectify(img))

@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SO-101 zero-shot grasping</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a; --text: #e6e8ee; --muted: #8b93a7;
+    --accent: #4f8cff; --ok: #39c07f; --warn: #f0b429; --bad: #ef5350; --ghost: #00dcff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; font-weight: 600; }
+  .chip { padding: 2px 10px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--line); color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .chip.ok { color: var(--ok); border-color: #2c5a45; } .chip.bad { color: var(--bad); border-color: #6a2f2f; }
+  .chip.warn { color: var(--warn); border-color: #6b5420; }
+  .spacer { flex: 1; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 440px; gap: 14px; padding: 14px; height: calc(100vh - 52px); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
+  .left { display: flex; flex-direction: column; gap: 14px; min-height: 0; }
+  .feed { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .feed .imgwrap { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; background: #000; position: relative; }
+  .feed img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .overlay { position: absolute; left: 12px; top: 12px; background: rgba(0,0,0,.65); padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+  .overlay .live { color: var(--bad); font-weight: 700; margin-right: 8px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin-left: auto; }
+  .seg button { background: transparent; color: var(--muted); border: 0; padding: 3px 10px; cursor: pointer; font-size: 12px; }
+  .seg button.on { background: var(--panel2); color: var(--text); }
+  .controls { display: flex; gap: 10px; padding: 12px; align-items: center; }
+  .controls input[type=text] { flex: 1; background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 15px; outline: none; }
+  .controls input[type=text]:focus { border-color: var(--accent); }
+  button.btn { border: 0; border-radius: 8px; padding: 10px 16px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  button.btn:disabled { opacity: .4; cursor: not-allowed; }
+  .run { background: var(--accent); color: white; } .stop { background: var(--warn); color: #1b1300; }
+  .estop { background: var(--bad); color: white; letter-spacing: .04em; }
+  label.keep { color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  .right { display: flex; flex-direction: column; gap: 14px; min-height: 0; }
+  .robot img { width: 100%; display: block; background: #0b0d10; aspect-ratio: 4/3; }
+  .joints { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; padding: 8px 10px; font-size: 11px; color: var(--muted); text-align: center; }
+  .joints b { display: block; color: var(--text); font-size: 13px; font-weight: 600; }
+  .steps { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .steplist { overflow: auto; flex: 1; padding: 6px 0; }
+  .step { padding: 7px 12px; border-left: 3px solid transparent; cursor: pointer; }
+  .step:hover { background: var(--panel2); }
+  .step .row { display: flex; align-items: center; gap: 10px; }
+  .step .icon { width: 18px; text-align: center; font-weight: 700; }
+  .step .label { flex: 1; }
+  .step .time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .step .msg { color: var(--muted); font-size: 12px; margin: 2px 0 0 28px; }
+  .step.pending { color: var(--muted); } .step.active { border-left-color: var(--accent); background: #1a2233; }
+  .step.done .icon { color: var(--ok); } .step.failed .icon, .step.failed .msg { color: var(--bad); }
+  .step.stopped .icon, .step.stopped .msg { color: var(--warn); } .step.skipped { color: var(--muted); }
+  .detail { margin: 6px 0 4px 28px; font-size: 12px; }
+  .detail table { border-collapse: collapse; width: 100%; }
+  .detail td { padding: 2px 6px 2px 0; vertical-align: top; } .detail td:first-child { color: var(--muted); white-space: nowrap; width: 1%; }
+  .thumbs { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+  .thumbs img { height: 70px; border-radius: 4px; border: 1px solid var(--line); cursor: zoom-in; }
+  .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--accent); border-right-color: transparent; border-radius: 50%; animation: s .8s linear infinite; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  .log { max-height: 130px; overflow: auto; font: 12px/1.4 ui-monospace, monospace; color: var(--muted); padding: 8px 12px; border-top: 1px solid var(--line); }
+  .result { font-weight: 700; } .result.held { color: var(--ok); } .result.missed, .result.bad { color: var(--bad); }
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: none; align-items: center; justify-content: center; z-index: 10; }
+  .modal.show { display: flex; }
+  .dialog { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; max-width: 92vw; max-height: 92vh; overflow: auto; }
+  .dialog h3 { margin: 0 0 6px; } .dialog p { color: var(--muted); margin: 0 0 12px; }
+  .dialog .imgs { display: flex; gap: 12px; align-items: flex-start; }
+  .dialog .imgs img { max-height: 62vh; max-width: 44vw; border-radius: 6px; border: 1px solid var(--line); }
+  .dialog .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+  .approve { background: var(--ok); color: #04130b; } .cancel { background: var(--panel2); color: var(--text); border: 1px solid var(--line) !important; }
+  .lightbox img { max-width: 92vw; max-height: 90vh; border-radius: 8px; }
+  .pickbtn { background: #7c5cff; color: white; }
+  .imgwrap.picking { outline: 3px solid #7c5cff; outline-offset: -3px; }
+  .imgwrap.picking img { cursor: crosshair; }
+  .banner { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); background: #7c5cff; color: white;
+            padding: 8px 16px; border-radius: 999px; font-weight: 600; display: none; max-width: 80%; text-align: center; }
+  .imgwrap.picking .banner { display: block; }
+  .clickmark { position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px; border: 3px solid #ff3b6b;
+               border-radius: 50%; box-shadow: 0 0 0 2px rgba(0,0,0,.6); pointer-events: none; display: none; }
+  .neutral { background: var(--panel2); color: var(--text); border: 1px solid var(--line) !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SO-101 zero-shot grasping</h1>
+  <span class="chip" id="chip-models">models</span>
+  <span class="chip" id="chip-arm">arm</span>
+  <span class="chip" id="chip-camera">camera</span>
+  <span class="chip" id="chip-torque">torque</span>
+  <span class="spacer"></span>
+  <span id="result" class="result"></span>
+</header>
+
+<main>
+  <section class="left">
+    <div class="card feed">
+      <h2>Wrist camera
+        <span class="seg" id="camview">
+          <button data-v="rect" class="on">Straightened</button><button data-v="raw">Raw fisheye</button>
+        </span>
+      </h2>
+      <div class="imgwrap">
+        <img id="cam" src="/stream/camera.mjpg?view=rect" alt="camera">
+        <div class="overlay"><span class="live">LIVE</span><span id="overlay-step">idle</span></div>
+        <div class="banner" id="banner"></div>
+        <div class="clickmark" id="clickmark"></div>
+      </div>
+      <div class="controls">
+        <input id="prompt" type="text" placeholder='What should it pick up? e.g. "black dry erase marker"' autocomplete="off">
+        <label class="keep"><input type="checkbox" id="keep"> keep holding</label>
+        <button class="btn run" id="run">Run</button>
+        <button class="btn pickbtn" id="pickbtn" title="Move to the scan pose, then click the object in the camera view">Pick by clicking</button>
+        <button class="btn stop" id="stop" title="Hold, then return to rest. Press again while returning to cut torque where it is.">Stop</button>
+        <button class="btn estop" id="estop" title="Disable torque immediately: the arm drops onto its stops.">E-STOP</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="right">
+    <div class="card robot">
+      <h2>Arm (live)
+        <span class="seg" id="robotview">
+          <button data-v="3/4" class="on">3/4</button><button data-v="side">Side</button><button data-v="top">Top</button><button data-v="front">Front</button>
+        </span>
+      </h2>
+      <img id="robot" src="/stream/robot.mjpg" alt="robot">
+      <div class="joints" id="joints"></div>
+    </div>
+    <div class="card steps">
+      <h2>Plan <span id="query" style="text-transform:none;letter-spacing:0;color:var(--text)"></span></h2>
+      <div class="steplist" id="steps"></div>
+      <div class="log" id="log"></div>
+    </div>
+  </section>
+</main>
+
+<div class="modal" id="confirm">
+  <div class="dialog">
+    <h3 id="confirm-title">Approve grasp?</h3>
+    <p id="confirm-prompt"></p>
+    <div class="imgs" id="confirm-imgs"></div>
+    <div class="actions" id="confirm-actions"></div>
+  </div>
+</div>
+<div class="modal lightbox" id="lightbox"><img id="lightbox-img" alt=""></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const JOINTS = ["pan", "lift", "elbow", "w.flex", "w.roll", "grip %"];
+const ICON = { pending: "○", done: "✓", failed: "✗", stopped: "■", skipped: "–" };
+const expanded = new Set();
+let state = null, confirmId = null;
+
+async function post(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  if (!r.ok) { const t = await r.text(); alert(`${url}: ${t}`); }
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function fmtVal(v) {
+  if (Array.isArray(v)) return v.length ? v.map(fmtVal).join(", ") : "none";
+  if (typeof v === "boolean") return v ? "yes" : "no";
+  return esc(v);
+}
+function chip(id, label, value) {
+  const el = $(id); el.textContent = `${label}: ${value}`;
+  el.className = "chip " + (String(value).startsWith("ok") || value === "on" ? "ok" : String(value).startsWith("error") ? "bad" : "warn");
+  el.title = value;
+}
+function elapsed(st) {
+  if (!st.t0) return "";
+  const end = st.t1 || Date.now() / 1000;
+  return `${(end - st.t0).toFixed(1)} s`;
+}
+
+function render(s) {
+  state = s;
+  chip("chip-models", "models", s.status.models);
+  chip("chip-arm", "arm", s.status.arm);
+  chip("chip-camera", "camera", s.status.camera);
+  chip("chip-torque", "torque", s.torque ? "on" : "off");
+  $("chip-torque").className = "chip " + (s.torque ? "warn" : "ok");
+
+  const ready = s.status.models === "ok" && String(s.status.arm).startsWith("ok") && String(s.status.camera).startsWith("ok");
+  $("run").disabled = s.busy || !ready;
+  $("pickbtn").disabled = s.busy || !ready;
+  $("stop").disabled = !s.busy;
+  $("prompt").disabled = s.busy;
+  $("query").textContent = s.query ? `"${s.query}"` : (s.mode === "click" && (s.busy || s.result) ? "(picked by clicking)" : "");
+  const wrap = document.querySelector(".imgwrap");
+  wrap.classList.toggle("picking", !!s.pick);
+  $("banner").textContent = s.pick ? s.pick.prompt : "";
+  if (!s.busy) $("clickmark").style.display = "none";
+
+  const res = $("result");
+  res.textContent = s.busy ? "running..." : (s.result ? `last result: ${s.result}` : "");
+  res.className = "result " + (s.result === "held" ? "held" : (s.result && s.result !== "held" ? "bad" : ""));
+
+  const active = s.steps.find(x => x.status === "active");
+  $("overlay-step").textContent = active ? active.label : (s.busy ? "working..." : "idle");
+
+  if (s.joints_deg) {
+    const vals = [...s.joints_deg, s.gripper_pct];
+    $("joints").innerHTML = vals.map((v, i) => `<div>${JOINTS[i]}<b>${v == null ? "-" : Number(v).toFixed(1)}</b></div>`).join("");
+  }
+
+  $("steps").innerHTML = s.steps.map(st => {
+    const icon = st.status === "active" ? '<span class="spin"></span>' : (ICON[st.status] || "○");
+    const open = expanded.has(st.id) || st.status === "active" || st.status === "failed";
+    const det = Object.entries(st.detail || {});
+    const body = open && (det.length || st.images.length) ? `
+      <div class="detail">
+        ${det.length ? `<table>${det.map(([k, v]) => `<tr><td>${esc(k.replace(/_/g, " "))}</td><td>${fmtVal(v)}</td></tr>`).join("")}</table>` : ""}
+        ${st.images.length ? `<div class="thumbs">${st.images.map(u => `<img src="${u}" data-full="${u}">`).join("")}</div>` : ""}
+      </div>` : "";
+    return `<div class="step ${st.status}" data-id="${st.id}">
+      <div class="row"><span class="icon">${icon}</span><span class="label">${esc(st.label)}</span><span class="time">${elapsed(st)}</span></div>
+      ${st.message ? `<div class="msg">${esc(st.message)}</div>` : ""}${body}</div>`;
+  }).join("");
+
+  const log = $("log"); const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  log.innerHTML = s.logs.map(esc).join("<br>");
+  if (atBottom) log.scrollTop = log.scrollHeight;
+
+  if (s.confirm && s.confirm.id !== confirmId) {
+    confirmId = s.confirm.id;
+    $("confirm-title").textContent = s.confirm.title || "Confirm";
+    $("confirm-actions").innerHTML = (s.confirm.options || []).map(o => {
+      const cls = ["yes", "grasp"].includes(o.value) ? "approve" : (["no", "cancel"].includes(o.value) ? "cancel" : "neutral");
+      return `<button class="btn ${cls}" data-v="${esc(o.value)}">${esc(o.label)}</button>`;
+    }).reverse().join("");
+    $("confirm-prompt").textContent = s.confirm.prompt;
+    $("confirm-imgs").innerHTML = s.confirm.images.map(u => `<img src="${u}">`).join("");
+    $("confirm").classList.add("show");
+  } else if (!s.confirm && confirmId) {
+    confirmId = null; $("confirm").classList.remove("show");
+  }
+}
+
+$("steps").addEventListener("click", (e) => {
+  const img = e.target.closest("img[data-full]");
+  if (img) { $("lightbox-img").src = img.dataset.full; $("lightbox").classList.add("show"); return; }
+  const step = e.target.closest(".step"); if (!step) return;
+  const id = step.dataset.id; expanded.has(id) ? expanded.delete(id) : expanded.add(id);
+  if (state) render(state);
+});
+$("lightbox").addEventListener("click", () => $("lightbox").classList.remove("show"));
+$("run").addEventListener("click", () => post("/api/run", { query: $("prompt").value, keep: $("keep").checked }));
+$("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !$("run").disabled) $("run").click(); });
+$("stop").addEventListener("click", () => post("/api/stop"));
+$("estop").addEventListener("click", () => post("/api/estop"));
+$("confirm-actions").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-v]");
+  if (b && confirmId) post("/api/confirm", { id: confirmId, answer: b.dataset.v });
+});
+$("pickbtn").addEventListener("click", () => post("/api/run", { mode: "click", keep: $("keep").checked }));
+let camView = "rect";
+$("cam").addEventListener("click", (e) => {
+  if (!state || !state.pick) return;
+  const img = $("cam"), r = img.getBoundingClientRect();
+  // object-fit: contain -> the picture may be letterboxed inside the element
+  const s = Math.min(r.width / img.naturalWidth, r.height / img.naturalHeight);
+  const w = img.naturalWidth * s, h = img.naturalHeight * s;
+  const x0 = r.left + (r.width - w) / 2, y0 = r.top + (r.height - h) / 2;
+  const fx = (e.clientX - x0) / w, fy = (e.clientY - y0) / h;
+  if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return;
+  const wr = img.parentElement.getBoundingClientRect(), m = $("clickmark");
+  m.style.left = `${e.clientX - wr.left}px`; m.style.top = `${e.clientY - wr.top}px`; m.style.display = "block";
+  post("/api/click", { id: state.pick.id, x: fx, y: fy, view: camView });
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("lightbox").classList.remove("show"); });
+for (const [segId, handler] of [["camview", v => { camView = v; $("cam").src = `/stream/camera.mjpg?view=${v}`; }],
+                                ["robotview", v => post("/api/robot_view", { view: v })]]) {
+  $(segId).addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    for (const x of $(segId).children) x.classList.toggle("on", x === b);
+    handler(b.dataset.v);
+  });
+}
+// Server-sent state; reconnects automatically if the server restarts.
+function connect() {
+  const es = new EventSource("/api/events");
+  es.onmessage = (e) => render(JSON.parse(e.data));
+  es.onerror = () => { es.close(); setTimeout(connect, 1000); };
+}
+connect();
+</script>
+</body>
+</html>

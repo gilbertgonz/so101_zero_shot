@@ -15,32 +15,35 @@ import mujoco  # noqa: E402
 import numpy as np  # noqa: E402
 
 from ..config import MJCF_SCENE_PATH  # noqa: E402
+from ..gripper_model import gripper_qadr, set_gripper_qpos  # noqa: E402
 from ..hardware.so101 import ARM_JOINTS  # noqa: E402
 
 # Pairs that are always close by construction (their distance does not depend on the joints that
-# matter here): base on the table, shoulder just above it, the moving jaw beside the wrist.
+# matter here): base on the table, shoulder just above it.
 _IGNORED_PAIRS = {
     frozenset({"base", "world"}),
     frozenset({"shoulder", "world"}),
-    frozenset({"wrist", "moving_jaw_so101_v1"}),
 }
 
 
 class CollisionChecker:
-    def __init__(self, margin_m: float = 0.015, gripper_deg: float = 20.0):
+    def __init__(self, margin_m: float = 0.015, gripper_pct: float = 100.0):
+        """Checks with the gripper `gripper_pct` open (default fully open: the widest it gets)."""
         self.model = mujoco.MjModel.from_xml_path(str(MJCF_SCENE_PATH))
         self.data = mujoco.MjData(self.model)
         self.margin_m = margin_m
         # MuJoCo reports a contact when dist < margin_a + margin_b; filter to dist < margin_m below.
         self.model.geom_margin[:] = margin_m
-        self.gripper_deg = gripper_deg
-        self._joint_qpos = [self.model.joint(n).qposadr[0] for n in (*ARM_JOINTS, "gripper")]
+        self.gripper_pct = gripper_pct
+        self._joint_qpos = [self.model.joint(n).qposadr[0] for n in ARM_JOINTS]
+        self._gripper_qpos = gripper_qadr(self.model)
 
     def contacts(self, joints_deg: np.ndarray) -> list[tuple[str, str, float]]:
         """(body_a, body_b, signed distance m) for every pair closer than the margin."""
         self.data.qpos[:] = 0.0
-        for adr, v in zip(self._joint_qpos, (*np.asarray(joints_deg, dtype=float), self.gripper_deg)):
+        for adr, v in zip(self._joint_qpos, np.asarray(joints_deg, dtype=float)):
             self.data.qpos[adr] = np.deg2rad(v)
+        set_gripper_qpos(self.model, self.data.qpos, self.gripper_pct, qadr=self._gripper_qpos)
         mujoco.mj_forward(self.model, self.data)
         out = []
         for c in self.data.contact[: self.data.ncon]:

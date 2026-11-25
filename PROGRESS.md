@@ -114,5 +114,74 @@ Findings
   Plan: absorb the remaining error in phase 3 by re-looking from directly above the target before the
   grasp (object near image centre, short range) instead of chasing monocular depth accuracy.
 
+## 2026-11-25: Phase 3 (top-down grasp), in progress
+
+- scripts/grasp.py QUERY: scan -> coarse locate -> re-look (camera ~20 cm from the target, sampled IK,
+  safe paths checked) -> re-locate -> plan -> confirm -> open, pregrasp, descend 15 deg/s, close, lift ->
+  put back -> rest. `--dry-run SCENE` plans and renders from a saved scene without moving.
+- Jaw closing direction = camera x axis (fingers are left/right in the image), from the calibration; the
+  stock MuJoCo jaw swings along a different axis, so the model is not used for this.
+- Straight-down is only reachable with the fingertips low (<= ~6 cm at x ~ 0.25 m): pregrasp 5 cm and
+  lift 7 cm above the grasp point, allowed to tilt up to 20 deg.
+- Wrist roll is chosen so the jaws close across the object's long axis (PCA of the top-surface points).
+- Grasp 1 (grasp_20261125_111100, "black dry erase marker" at (30.3, 4.7) cm): FIRST ZERO-SHOT GRASP,
+  held and lifted cleanly (after_lift.jpg), jaws 3 deg from ideal, fingertips 8.8 mm above the table.
+  Logged as "missed" because the held check used gripper position: the parallel jaws close to 0.7 %
+  around a marker. gripper_probe.py: empty 0.2 % / |load| 28, marker 0.9 % / |load| 72. Held is now
+  |load| >= 50 or opening >= 4 % (grasping/feedback.py). One sample each; recheck on more objects.
+
+- Web UI (scripts/ui.py, FastAPI + one HTML page, 127.0.0.1 only): live camera (straightened/raw), live arm
+  render from joint readings at 10 Hz with a cyan ghost of the pose being moved to, prompt, plan panel with
+  per-step numbers and images, approval dialog, Stop, E-STOP. `--fake` = real arm code on a simulated bus.
+- Grasp sequence moved to grasping/runner.py, shared by the CLI and the UI.
+- Stopping: SO101Arm.request_stop() interrupts a move at the next control tick (hold + MotionStopped);
+  emergency_torque_off() from any thread; the bus is now locked per transaction. Found and fixed with the
+  simulated UI: a Stop pressed at the approval dialog used to also abort the return home, cutting torque
+  with the arm in the air (regression test in tests/test_grasp_runner.py).
+- Click to pick (UI "Pick by clicking"): the arm goes to scan, the user clicks the object, SAM masks it at
+  the click (no VLM pointing), depth gives its position, then the VLM names the outlined crop. A card shows
+  the name, position, height and mask before anything moves: grasp / pick again / cancel. Clicks on the
+  gripper (mask mostly below the fingertip row) are rejected; out-of-reach objects can only be re-picked or
+  cancelled. Raw-view clicks are mapped through the fisheye model into the straightened view. After the
+  re-look the object is re-found by name and kept only if within 4 cm of the clicked estimate, otherwise
+  SAM is re-run at the projected clicked position. Checked in --fake mode; not yet on the real arm.
+- Note on --fake: the sim arm sits exactly at the scan pose, but the saved image was taken with the elbow
+  2.5 deg off, so object positions in the sim are off by several cm (mug 39 cm vs 32 cm). Real runs use
+  the measured joints.
+- Parallel gripper modelled (assets/so101/so101_new_calib.xml): the stock fixed + moving jaw are replaced
+  by the roboninecom repo's meshes (@42b4e72): link5_1 (frame, servo, rods, camera holder) on the
+  wrist-roll flange and two clamps on slide joints (`gripper`, `gripper_left`, metres open each), driven
+  from gripper % by gripper_model.set_gripper_qpos (100 % = 46 mm gap, estimated from the CAD pinion;
+  tool.gripper_open_gap_m). Live view, plan renders and collision checks use it.
+  - Placement checks: CAD fingertips 13.2 cm from the flange = measured tip length; CAD camera holder
+    within 1 cm of the hand-eye camera position.
+  - Tool point is now the CAD fingertip centre (tool.tip_xyz_m = [0, 0, -0.1318], replacing
+    tip_extension_m): same length, but on the wrist-roll axis instead of 8 mm off it (the stock jaw's
+    offset). Re-planning grasp 1 moves the pan by 1.7 deg.
+  - Rendered from the hand-eye camera into the straightened view, the clamps only overlap the real
+    fingers by IoU 0.30. Fitting the camera pose to the finger silhouette alone gives IoU 0.85 (shape
+    matches) but the camera moves ~2 cm / 10 deg and the board reprojection goes 6.6 -> 27 px; a joint fit
+    cannot satisfy both. Mounting rotation about the roll axis does not explain it (IoU <= 0.36). So the
+    hand-eye result is an "effective" pose that absorbs arm/FK error and is not the physical camera mount;
+    keep it for 3D geometry, use a separate silhouette-fitted camera pose for an image mask of the fingers.
+  - Tried to reconcile them: per-joint offsets (shoulder lift, elbow, wrist flex, wrist roll) with the
+    camera fixed at the finger pose leave 22.8 px on the boards; a joint fit of boards + finger contour +
+    offsets stops at ~17 px; free camera + offsets reaches 5.6 px only with +-15 deg offsets (overfit).
+    The fingers are 12-39 deg off-axis, inside the calibrated lens region, so not the lens model either.
+    Unresolved; a proper fix needs more data (e.g. board views at several gripper-near distances, or
+    fingertip touch points). Practical split kept: hand-eye for 3D, finger-fit pose for the mask.
+- Gripper mask (perception/gripper_mask.py, config/calibration/gripper_view.yaml from
+  scripts/fit_gripper_view.py: SAM on the real fingers, IoU fit from a grid of starts, 0.835).
+  The gripper's outline only depends on the jaw opening, so masks are pre-rendered per 5 % and the runner
+  passes the measured opening with each photo. Geometry nearer than 3 cm (camera holder rim) is clipped.
+  - Click/answer rejection: > 50 % of the mask on the (6 px grown) gripper = the gripper, otherwise the
+    gripper pixels are just dropped. Replaces the "below the fingertip row" rule, which rejected a cap
+    sitting beside the left finger (grasp_20261125_131428); it is now "white plastic cap" at (22.8, 15.5).
+  - Depth fit: leaves out the fingers + 25 px instead of every row below the fingertips, so table beside
+    the fingers counts. Can/mug unchanged (33.0 / 33.2 cm, tops 10.6 / 10.9 cm); the cap no longer comes out
+    below the table, but its height (~0 cm) is still not trustworthy this close to the fingers.
+  - Scene 102546's marker (mostly hidden behind the fingers) is now refused instead of measured at -1.6 cm.
+
 Next
-- Phase 3: top-down grasp: coarse locate from scan, move above the target, re-locate, descend, close, lift.
+- More grasps (different objects, positions, orientations) to measure the success rate.
+- VLM check of the after-lift image as a second opinion on "held".

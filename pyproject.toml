@@ -23,6 +23,7 @@ dependencies = [
 sim = ["mujoco>=3.1"]
 # Phase 2 perception. torch: install the CUDA build, e.g. --index-url https://download.pytorch.org/whl/cu126
 perception = ["torch>=2.5", "transformers>=4.57", "accelerate>=1.0"]
+ui = ["fastapi>=0.110", "uvicorn>=0.29"]
 dev = ["pytest>=8"]
 
 [tool.setuptools.packages.find]

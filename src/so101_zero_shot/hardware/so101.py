@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -90,8 +91,16 @@ def save_calibration(path: Path, calibration: dict[str, MotorCalibration]) -> No
     path.write_text(json.dumps({k: asdict(v) for k, v in calibration.items()}, indent=4) + "\n")
 
 
+class MotionStopped(RuntimeError):
+    """A move was interrupted by SO101Arm.request_stop(); the arm is holding where it was."""
+
+
 class SO101Arm:
-    """Blocking, safety-first interface to the SO-101 follower arm."""
+    """Blocking, safety-first interface to the SO-101 follower arm.
+
+    Motion commands run in the caller's thread. Another thread may call request_stop() (the move holds
+    and raises MotionStopped at the next control tick) or emergency_torque_off(); bus access is locked.
+    """
 
     def __init__(
         self,
@@ -115,6 +124,8 @@ class SO101Arm:
         self.calibration: dict[str, MotorCalibration] = {}
         self.joint_offsets = {m: float((joint_offsets_deg or {}).get(m, 0.0)) for m in ARM_JOINTS}
         self.gripper_inverted = gripper_inverted
+        self.stop_event = threading.Event()
+        self.estopped = False  # set by emergency_torque_off(); cleared by clear_stop()
 
     # ------------------------------------------------------------------ lifecycle
     def connect(self, enable_torque: bool = True) -> None:
@@ -211,6 +222,26 @@ class SO101Arm:
         if bad:
             raise ValueError("joint target outside soft limits: " + "; ".join(bad))
 
+    # ------------------------------------------------------------------ stopping
+    def request_stop(self) -> None:
+        """Ask the running (or next) motion command to hold and raise MotionStopped."""
+        self.stop_event.set()
+
+    def clear_stop(self) -> None:
+        self.stop_event.clear()
+        self.estopped = False
+
+    def _check_stop(self) -> None:
+        if self.stop_event.is_set():
+            self.hold()
+            raise MotionStopped("motion stopped on request")
+
+    def emergency_torque_off(self) -> None:
+        """Disable torque on every servo now (the arm drops onto its stops). Safe from any thread."""
+        self.estopped = True
+        self.stop_event.set()
+        self.bus.disable_torque(num_retry=5)
+
     # ------------------------------------------------------------------ commands
     def _send(self, joints_deg: np.ndarray, gripper: float | None) -> None:
         goal = {m: self.deg_to_ticks(m, q) for m, q in zip(ARM_JOINTS, joints_deg)}
@@ -242,6 +273,7 @@ class SO101Arm:
         """
         target = np.asarray(joints_deg, dtype=float)
         self.check_limits(target)
+        self._check_stop()
         speed = min(speed_deg_s or self.max_speed_deg_s, self.max_speed_deg_s)
         start = self.read_joints()
         g_start = self.read_gripper() if gripper is not None else None
@@ -254,6 +286,7 @@ class SO101Arm:
             a = i / n
             a = a * a * (3 - 2 * a)  # smoothstep: zero velocity at both ends
             g = None if gripper is None else g_start + a * (gripper - g_start)
+            self._check_stop()
             self._send(start + a * (target - start), g)
             t_next += period
             time.sleep(max(0.0, t_next - time.perf_counter()))
@@ -276,6 +309,7 @@ class SO101Arm:
         deadline = time.perf_counter() + timeout_s
         prev = None
         while True:
+            self._check_stop()
             q = self.read_joints()
             err = target - q
             stopped = prev is not None and np.max(np.abs(q - prev)) < 0.1
@@ -292,6 +326,7 @@ class SO101Arm:
         start = self.read_gripper()
         n = max(int(duration_s * self.control_hz), 1)
         for i in range(1, n + 1):
+            self._check_stop()
             self.bus.sync_write("Goal_Position", {GRIPPER: self.gripper_to_ticks(start + (pct - start) * i / n)})
             time.sleep(1.0 / self.control_hz)
         time.sleep(0.3)
@@ -308,6 +343,7 @@ __all__ = [
     "MOTOR_IDS",
     "CalibrationError",
     "FeetechError",
+    "MotionStopped",
     "SO101Arm",
     "load_calibration",
     "joint_limits_from_calibration",

@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -65,6 +67,8 @@ SIGN_BIT: dict[str, int] = {
     "Goal_Velocity": 15,
     "Present_Position": 15,
     "Present_Velocity": 15,
+    "Present_Load": 10,  # 0.1 % of max torque; sign = direction
+    "Present_Current": 15,
 }
 
 
@@ -107,8 +111,19 @@ def _patched_set_packet_timeout(self, packet_length):  # noqa: N802
     self.packet_timeout = (self.tx_time_per_byte * packet_length) + (self.tx_time_per_byte * 3.0) + 50
 
 
+def _locked(fn):
+    """Serialise bus transactions: an emergency stop may come from another thread mid-motion."""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+
+    return wrapper
+
+
 class FeetechBus:
-    """Raw register access to a set of named STS3215 servos on one serial port."""
+    """Raw register access to a set of named STS3215 servos on one serial port. Thread-safe per call."""
 
     def __init__(self, port: str, motors: dict[str, int], baudrate: int = DEFAULT_BAUDRATE):
         if len(set(motors.values())) != len(motors):
@@ -124,6 +139,7 @@ class FeetechBus:
         self._packet_handler = scs.PacketHandler(0)
         self._sync_reader = scs.GroupSyncRead(self._port_handler, self._packet_handler, 0, 0)
         self._sync_writer = scs.GroupSyncWrite(self._port_handler, self._packet_handler, 0, 0)
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ connection
     @property
@@ -164,6 +180,7 @@ class FeetechBus:
                 "Check servo power and cabling."
             )
 
+    @_locked
     def disconnect(self, disable_torque: bool = True) -> None:
         if not self.is_connected:
             return
@@ -187,6 +204,7 @@ class FeetechBus:
         if not self.is_connected:
             raise FeetechError(f"bus on {self.port!r} is not connected")
 
+    @_locked
     def read(self, register: str, motor: str, num_retry: int = 2) -> int:
         self._require_connected()
         addr, length = CONTROL_TABLE[register]
@@ -199,6 +217,7 @@ class FeetechBus:
         self._check(comm, error, f"read {register} from {motor}")
         return decode_sign_magnitude(value, SIGN_BIT[register]) if register in SIGN_BIT else value
 
+    @_locked
     def write(self, register: str, motor: str, value: int, num_retry: int = 2) -> None:
         self._require_connected()
         addr, length = CONTROL_TABLE[register]
@@ -213,6 +232,7 @@ class FeetechBus:
         self._check(comm, error, f"write {register}={value} to {motor}")
 
     # ------------------------------------------------------------------ group
+    @_locked
     def sync_read(self, register: str, motors: Sequence[str] | None = None, num_retry: int = 2) -> dict[str, int]:
         self._require_connected()
         names = list(self.motors) if motors is None else list(motors)
@@ -234,6 +254,7 @@ class FeetechBus:
             out[name] = decode_sign_magnitude(raw, SIGN_BIT[register]) if register in SIGN_BIT else raw
         return out
 
+    @_locked
     def sync_write(self, register: str, values: dict[str, int], num_retry: int = 1) -> None:
         """Fire-and-forget write (no status packet). Use for streaming goals, not configuration."""
         self._require_connected()
@@ -251,11 +272,13 @@ class FeetechBus:
         raise FeetechError(f"sync_write {register}: {self._packet_handler.getTxRxResult(comm)}")
 
     # ------------------------------------------------------------------ torque
+    @_locked
     def enable_torque(self, motors: Sequence[str] | None = None, num_retry: int = 2) -> None:
         for m in self.motors if motors is None else motors:
             self.write("Torque_Enable", m, 1, num_retry=num_retry)
             self.write("Lock", m, 1, num_retry=num_retry)
 
+    @_locked
     def disable_torque(self, motors: Sequence[str] | None = None, num_retry: int = 2) -> None:
         for m in self.motors if motors is None else motors:
             self.write("Torque_Enable", m, 0, num_retry=num_retry)
