@@ -49,3 +49,13 @@ calibration_board:
   square_mm: 14.767   # caliper 2026-11-25: 6 squares = 88.6 mm (single square 14.7 mm)
   marker_ratio: 0.75   # marker side / square side
   dictionary: DICT_5X5_100
+
+# Phase 2 perception (all local). Images are rectified from the fisheye to a pinhole view first; the
+# calibrated lens model is trustworthy to ~49 deg off-axis, so hfov 100 deg stays inside it.
+perception:
+  vlm_model: Qwen/Qwen3-VL-2B-Instruct   # smallest that grounds well; 4B is the fallback if pointing fails
+  sam_model: facebook/sam2.1-hiera-small
+  depth_model: depth-anything/Depth-Anything-V2-Small-hf
+  rectified_size: [960, 720]
+  rectified_hfov_deg: 100.0
+  table_z_m: 0.0   # the base sits on the table

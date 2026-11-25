@@ -92,5 +92,27 @@ Findings
 - Runs uploaded to the private HF dataset gilbertgonz/so101_zero_shot (all 6 calib sessions + README
   card in runs/README.md). Future uploads: `scripts/upload_runs.py` (checks the HF account first).
 
+## 2026-11-25: Phase 2 (perception), in progress
+
+- Models (smallest that work; all local): Qwen3-VL-2B-Instruct (pointing; 4B kept as fallback),
+  SAM 2.1 hiera-small (mask), Depth Anything V2 Small (relative depth). Load ~11 s, ~1-2 s per query.
+- Pipeline (perception/locate.py): fisheye -> pinhole (100 deg, inside the calibrated region) -> VLM box +
+  point -> SAM mask -> depth made metric by fitting it to the table (true table depth per pixel is known
+  from the calibrated camera pose) -> object points in the base frame, top height, top-surface centre.
+- Look pose = scan: the straightened view covers the whole workspace (docs: 5 cm table grid overlay).
+- Scene 1 (scene_20261125_102546: mug, Planters can, marker half under the gripper): all three found and
+  masked by the 2B model.
+- Lessons:
+  - The gripper fingers fill the bottom of the view, 5-12 cm from the lens; including the table between
+    them in the depth fit squashed heights (mug 3 cm). Rows below the projected fingertip are now
+    excluded from the fit -> mug 11.1 cm.
+  - The 2B model sometimes puts its point on a box corner: fall back to the box centre.
+  - Depth Anything V2 Base was worse than Small on this scene (can height 3 cm); staying with Small.
+- Ruler check (user): can lid 30.7 cm from the pan axis (est. 29.3 with top-surface centre; 28.6 before),
+  can height 8.3 cm (est. 10.4), mug height 10.2 cm (est. 11.1). Errors ~1-2 cm, object tops come out
+  too close to the camera. Objects under/between the fingers get no reliable height (marker: -1.6 cm).
+  Plan: absorb the remaining error in phase 3 by re-looking from directly above the target before the
+  grasp (object near image centre, short range) instead of chasing monocular depth accuracy.
+
 Next
-- Phase 2: perception (local VLM pointing, SAM, monocular depth scaled by the table plane).
+- Phase 3: top-down grasp: coarse locate from scan, move above the target, re-locate, descend, close, lift.
