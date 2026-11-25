@@ -27,7 +27,8 @@ workspace:
 
 camera:
   device: /dev/v4l/by-id/usb-5MP_USB_Camera_5MP_USB_Camera_01.00.00-video-index0
-  # 4:3 keeps the full fisheye circle; 16:9 modes crop top and bottom.
+  # 4:3 keeps the whole fisheye circle (16:9 modes crop it). 2592x1944 was tried for more pixels on the
+  # phone board but the camera dropped off USB repeatedly (2026-11-25); 1600x1200 has been stable.
   width: 1600
   height: 1200
   fps: 20
@@ -39,10 +40,12 @@ poses:
   # Tip ~16 cm above table, 23 cm out, fingers/camera tilted 45 deg forward. All joints >= 19 deg from limits.
   scan: [0.0, -50.0, 10.0, 85.0, 0.0]
 
-# Printed calibration board (scripts/make_charuco.py). After printing, measure a square and update square_mm.
+# Calibration board shown full screen on a phone lying flat on the table (scripts/make_charuco.py --phone,
+# docs/calibration/charuco_phone.png). Physical size depends on the phone, so square_mm must be measured:
+# long edge of the board (6 squares) in mm / 6. null = not measured yet; calibration refuses to run.
 calibration_board:
-  cols: 5
-  rows: 7
-  square_mm: 35.0
-  marker_mm: 26.0
+  cols: 4
+  rows: 6
+  square_mm: 14.767   # caliper 2026-11-25: 6 squares = 88.6 mm (single square 14.7 mm)
+  marker_ratio: 0.75   # marker side / square side
   dictionary: DICT_5X5_100

@@ -50,5 +50,45 @@ Findings
 - Sag compensation verified on hardware: scan pose errors <= 0.5 deg (elbow 5.1 -> 0.3), tip 3 mm from target.
   PHASE 0 DONE.
 
+## 2026-11-25: Phase 1 (camera calibration), in progress
+
+- No printer: ChArUco board shown full screen on a phone lying flat (docs/calibration/charuco_phone.png,
+  4x6 squares, caliper: 6 squares = 88.6 mm -> 14.767 mm squares).
+- Attempts 1-2: board visible from the scan pose but 0 corners. Auto exposure is set for the dim desk,
+  so the screen is blown out and the thin black marker borders wash out. Fix: exposure sweep at the scan
+  pose (keep the best), per-view retry at half/double exposure; phone image now has a dark surround.
+- Attempt 3: the camera dropped off USB (errno 19) repeatedly, at 2592x1944 and later at 1600x1200, even
+  with the arm still; intermittent. It shares an unpowered hub with the servo adapter. Camera wrapper now
+  auto-reconnects and re-applies exposure; back to 1600x1200. Hardware suspect: power or connector.
+- Attempt 4 (calib_20261125_091657): exposure sweep works (auto 0/15, manual 25 -> 15/15 corners). Captured
+  3 views, then the camera connector unseated at a steep wrist angle. Also found a safety bug: a non-Ctrl-C
+  error skipped the return-to-rest and went straight to torque-off (arm goes limp at the viewpoint). Fixed:
+  any error now returns scan -> rest first. Capture now parks at scan on disconnect, waits 20 s for the user
+  to reseat the connector, retries the view (skips after 2 disconnects), and `--resume` continues a session.
+  Exposure: each view starts from the last setting that worked (half/double retry if needed); a run or
+  resume tries the session's last good exposure at scan and only does the full sweep if it fails.
+- Resume of 091657: views 4-9 captured, then the arm bumped the desk monitor at view 10 (base 47 deg, tip
+  16 cm out to the side) and the servo bus reset (no status packet; arm limp). 8 usable frames kept.
+- Compact plan: tip within x 14-26 cm, |y| <= 8 cm, z 8-16 cm, base <= 25 deg, 10 views (was 40).
+  Per-view timing added: moves take 1-4 s; the earlier 10-30 s per view came from exposure retries on
+  views where the board is partly visible (one grab took 17 s), not from the arm.
+- Attempt 5 (calib_20261125_094009): 10/10 views, 9 usable, no disconnects, ~1 min.
+- Solver (scripts/solve_calibration.py, calibration/solve.py): cv2.fisheye intrinsics, then camera-in-
+  gripper_link + one board pose per session, refined through the arm FK. Both sessions used (17 frames).
+  Result (config/calibration/wrist_camera.yaml):
+  - fx 484.5, fy 484.3, c (806, 607), small distortion terms, rms 0.11 px.
+  - Camera 6.2 cm forward / 4.9 cm below gripper_link; optical axis 30 deg off the approach axis
+    (which is why "aim at the board" views put the board off-centre).
+  - Corners predicted from joint angles alone: rms 6.6 px (~3 mm at 25 cm), worst view 16 px.
+    This is the arm's own accuracy and bounds what grasping can expect from the wrist camera.
+  - Sanity: both sessions put the board at the same place (29, 0, 1) cm within 1 cm (phone did not
+    move), 3-4 deg from flat.
+  - Limits: the board corners only reach ~49 deg off-axis (413 px of ~1000 px), so the lens model is
+    extrapolated near the image edges. On synthetic data, intrinsics-only has ~2% focal bias; refining the
+    intrinsics through the arm FK fixes that on synthetic data but overfits arm error on the real arm
+    (fx/fy split 3%, board tilt 7 deg), so it is opt-in (--refine-intrinsics).
+  PHASE 1 DONE (good enough for centre-of-image grasping; revisit if edge accuracy matters).
+
 Next
-- Phase 1: fisheye intrinsics + hand-eye calibration.
+- Upload runs to the HF dataset gilbertgonz/so101_zero_shot (personal account).
+- Phase 2: perception (local VLM pointing, SAM, monocular depth scaled by the table plane).
