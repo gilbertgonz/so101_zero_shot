@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+# Data goes to Hugging Face (dataset gilbertgonz/so101_zero_shot), never to git.
+runs/
+data/
+*.mp4
+*.npz

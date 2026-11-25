@@ -1,0 +1,48 @@
+# Hardware config for the SO-101 on this laptop. Paths are relative to config/.
+arm:
+  # Stable by-id path (survives replug); /dev/ttyACM0 also works.
+  port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5AB0158804-if00
+  calibration_file: calibration/so101_follower.json
+  max_speed_deg_s: 45
+  # Per-joint correction vs the URDF (urdf_deg = raw_deg - offset). From known-pose checks on
+  # 2026-11-25: pose A (zero) read elbow 12.7, pose B (tip down) needed 11.2 to be vertical.
+  joint_offsets_deg:
+    elbow_flex: 11.5
+  # Parallel-jaw gripper (roboninecom SO-ARM100-101-102-Parallel-Gripper) reads max ticks when closed.
+  gripper_inverted: true
+  # Optional soft limits (deg) overriding the defaults in hardware/so101.py.
+  joint_limits_deg: {}
+
+tool:
+  # Parallel-gripper fingers are longer than the stock jaw in the URDF. Provisional value from
+  # pose B (model tip 3.4 cm above the table while the real tip touched it); confirm by measurement.
+  tip_extension_m: 0.034
+
+# Allowed grasp/target region in the base frame (m). +x forward, +y = arm's left, z = 0 is the table.
+# Every perception-derived target is checked against this before the arm moves.
+workspace:
+  x: [0.10, 0.32]
+  y: [-0.20, 0.20]
+  z: [0.0, 0.25]
+
+camera:
+  device: /dev/v4l/by-id/usb-5MP_USB_Camera_5MP_USB_Camera_01.00.00-video-index0
+  # 4:3 keeps the full fisheye circle; 16:9 modes crop top and bottom.
+  width: 1600
+  height: 1200
+  fps: 20
+
+# Named joint poses (deg, URDF convention): [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll].
+poses:
+  # Folded on its stops reads about [-2.5, -108, 90, 48, -2.5]; hold a few deg off the stops.
+  rest: [0.0, -104.0, 84.0, 50.0, 0.0]
+  # Tip ~16 cm above table, 23 cm out, fingers/camera tilted 45 deg forward. All joints >= 19 deg from limits.
+  scan: [0.0, -50.0, 10.0, 85.0, 0.0]
+
+# Printed calibration board (scripts/make_charuco.py). After printing, measure a square and update square_mm.
+calibration_board:
+  cols: 5
+  rows: 7
+  square_mm: 35.0
+  marker_mm: 26.0
+  dictionary: DICT_5X5_100

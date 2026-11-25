@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "so101_zero_shot"
+version = "0.1.0"
+description = "Zero-shot language-conditioned grasping on the SO-101 with a wrist fisheye camera"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+    "feetech-servo-sdk>=1.0",
+    "pyserial>=3.5",
+    "placo>=0.9",
+    "pyyaml>=6.0",
+    "huggingface_hub>=0.30",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+sim = ["mujoco>=3.1"]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
