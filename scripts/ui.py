@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -41,8 +42,24 @@ def main() -> None:
         fake_image = sd / "image.jpg"
     app = create_app(fake=bool(args.fake), fake_image=fake_image)
     print(f"open http://127.0.0.1:{args.port}" + ("  (SIMULATED arm and camera)" if args.fake else ""))
+    backend = app.state.backend
+
+    class Server(uvicorn.Server):
+        def handle_exit(self, sig, frame):
+            # End the open browser streams first; otherwise uvicorn waits for them forever and the app
+            # shutdown (stop the arm, torque off) never runs.
+            backend.close_streams()
+            super().handle_exit(sig, frame)
+
     # Local only: anyone who can reach this port can move the arm.
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+    config = uvicorn.Config(app, host="127.0.0.1", port=args.port, log_level="warning", timeout_graceful_shutdown=5)
+    Server(config).run()  # returns after the app shutdown: arm stopped, torque off, camera closed
+    # Exit without running native destructors: torch/CUDA and the MuJoCo EGL context abort during
+    # interpreter teardown ("terminate called without an active exception"), and the core dump of a
+    # multi-GB GPU process made the UI look like it ignored Ctrl-C.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

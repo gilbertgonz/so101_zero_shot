@@ -213,16 +213,26 @@ class Backend:
         self.robot_jpeg: bytes | None = None
         self.robot_view = "3/4"
         self._running = True
+        # Streams (camera, arm view, events) never end on their own; uvicorn waits for open connections
+        # before running the app shutdown, so they must be stopped first (see close_streams / scripts/ui.py).
+        self._streaming = True
         self._run_thread: threading.Thread | None = None
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
         threading.Thread(target=self._connect_hardware, daemon=True, name="hw").start()
         threading.Thread(target=self._load_models, daemon=True, name="models").start()
-        threading.Thread(target=self._monitor_arm, daemon=True, name="arm-monitor").start()
-        threading.Thread(target=self._render_robot, daemon=True, name="robot-view").start()
+        self._loops = [threading.Thread(target=self._monitor_arm, daemon=True, name="arm-monitor"),
+                       threading.Thread(target=self._render_robot, daemon=True, name="robot-view")]
+        for th in self._loops:
+            th.start()
+
+    def close_streams(self) -> None:
+        """End every open stream within ~1 s (called on Ctrl-C, before the server waits for connections)."""
+        self._streaming = False
 
     def shutdown(self) -> None:
+        self._streaming = False
         self._running = False
         if self.arm is not None:
             if self.hub.state.busy:
@@ -235,6 +245,8 @@ class Backend:
                 logger.error("arm disconnect: %s", e)
         if self.camera is not None:
             self.camera.disconnect()
+        for th in getattr(self, "_loops", []):  # they poll _running every 0.1 s
+            th.join(timeout=2.0)
 
     def _connect_hardware(self) -> None:
         try:
@@ -325,6 +337,7 @@ class Backend:
                     logger.exception("robot view render failed")
                     self.hub.log(f"robot view render failed: {e!r}")
                     last_err = repr(e)
+        r.close()  # in this thread: the EGL context belongs to it
 
     # ---------------------------------------------------------------- actions
     def start_run(self, query: str, keep: bool, mode: str = "prompt") -> None:
@@ -394,7 +407,7 @@ class Backend:
     # ---------------------------------------------------------------- streams
     def camera_frames(self, view: str):
         boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-        while self._running:
+        while self._streaming:
             cam = self.camera
             if cam is None:
                 time.sleep(0.2)
@@ -417,7 +430,7 @@ class Backend:
     def robot_frames(self):
         boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
         last = None
-        while self._running:
+        while self._streaming:
             jpg = self.robot_jpeg
             if jpg is not None and jpg is not last:
                 last = jpg
@@ -425,10 +438,12 @@ class Backend:
             time.sleep(0.05)
 
     def events(self):
-        version = -1
-        while self._running:
-            snap = self.hub.wait_change(version, timeout=15.0)
-            version = snap["version"]
+        version, last_sent = -1, 0.0
+        while self._streaming:
+            snap = self.hub.wait_change(version, timeout=1.0)  # short, so close_streams takes effect quickly
+            if snap["version"] == version and time.monotonic() - last_sent < 15.0:
+                continue
+            version, last_sent = snap["version"], time.monotonic()
             yield f"data: {json.dumps(snap, default=str)}\n\n"
 
 
@@ -444,6 +459,7 @@ def create_app(fake: bool = False, fake_image: Path | None = None) -> FastAPI:
         backend.shutdown()
 
     app = FastAPI(title="so101_zero_shot", lifespan=lifespan)
+    app.state.backend = backend
     app.state.backend = backend
 
     @app.get("/", response_class=HTMLResponse)
