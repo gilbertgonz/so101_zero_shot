@@ -10,9 +10,6 @@ it found and where, and asks before grasping.
 
 [![Demo: a language-prompt grasp and a click grasp, robot UI and real robot side by side](docs/media/demo_poster.jpg)](docs/media/so101_zero_shot_demo.mp4)
 
-*Demo (85 s): "black wall outlet" from a text prompt, then a marker picked by clicking. Left: the
-robot's UI (wrist camera, plan, live arm model); right: the real robot, time-synced.*
-
 ## Setup
 ```
 python3 -m venv .venv
