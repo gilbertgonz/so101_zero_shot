@@ -1,8 +1,17 @@
 # so101_zero_shot
 
+## Summary
+
 Zero-shot, language-conditioned grasping on an SO-101 arm with a single wrist-mounted fisheye camera:
 VLM points at the object from a prompt, SAM masks it, monocular depth lifts it to 3D, and a top-down IK
 grasp picks it up. No demonstrations, no training. All models run locally.
+Instead of typing a prompt you can also click the object in the live camera view; the robot names what
+it found and where, and asks before grasping.
+
+[![Demo: a language-prompt grasp and a click grasp, robot UI and real robot side by side](docs/media/demo_poster.jpg)](docs/media/so101_zero_shot_demo.mp4)
+
+*Demo (85 s): "black wall outlet" from a text prompt, then a marker picked by clicking. Left: the
+robot's UI (wrist camera, plan, live arm model); right: the real robot, time-synced.*
 
 ## Setup
 ```
