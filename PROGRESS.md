@@ -89,6 +89,8 @@ Findings
     (fx/fy split 3%, board tilt 7 deg), so it is opt-in (--refine-intrinsics).
   PHASE 1 DONE (good enough for centre-of-image grasping; revisit if edge accuracy matters).
 
+- Runs uploaded to the private HF dataset gilbertgonz/so101_zero_shot (all 6 calib sessions + README
+  card in runs/README.md). Future uploads: `scripts/upload_runs.py` (checks the HF account first).
+
 Next
-- Upload runs to the HF dataset gilbertgonz/so101_zero_shot (personal account).
 - Phase 2: perception (local VLM pointing, SAM, monocular depth scaled by the table plane).
