@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -47,8 +48,8 @@ class LiveRenderer:
     """
 
     def __init__(self, size=(480, 360), azimuth: float = 135.0, elevation: float = -25.0,
-                 open_gap_m: float = DEFAULT_OPEN_GAP_M):
-        self.model = mujoco.MjModel.from_xml_path(str(MJCF_SCENE_PATH))
+                 open_gap_m: float = DEFAULT_OPEN_GAP_M, scene_path: Path = MJCF_SCENE_PATH):
+        self.model = mujoco.MjModel.from_xml_path(str(scene_path))
         self.data = mujoco.MjData(self.model)
         w, h = size
         self.model.vis.global_.offwidth, self.model.vis.global_.offheight = max(w, 640), max(h, 480)
@@ -72,6 +73,13 @@ class LiveRenderer:
     def render(self, joints_deg: np.ndarray, gripper_pct: float = 0.0) -> np.ndarray:
         """BGR image of the arm at `joints_deg` with the gripper `gripper_pct` open."""
         self._pose(joints_deg, gripper_pct)
+        return cv2.cvtColor(self.renderer.render(), cv2.COLOR_RGB2BGR)
+
+    def render_qpos(self, qpos: np.ndarray) -> np.ndarray:
+        """BGR image of a full simulation state (same scene file as the simulation: arm and objects)."""
+        self.data.qpos[:] = qpos
+        mujoco.mj_forward(self.model, self.data)
+        self.renderer.update_scene(self.data, camera=self.cam)
         return cv2.cvtColor(self.renderer.render(), cv2.COLOR_RGB2BGR)
 
     def arm_mask(self, joints_deg: np.ndarray, gripper_pct: float = 0.0) -> np.ndarray:

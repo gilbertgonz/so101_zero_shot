@@ -150,8 +150,12 @@ def render_plan(poses: list[tuple[str, np.ndarray, float]]) -> np.ndarray:
 
 class GraspRunner:
     def __init__(self, cfg: RobotConfig, kin: SO101Kinematics, cam_model: FisheyeCamera, rect: Rectifier,
-                 planner: TopDownPlanner, locator: Locator, reporter: Reporter, speed_deg_s: float = 30.0):
+                 planner: TopDownPlanner, locator: Locator, reporter: Reporter, speed_deg_s: float = 30.0,
+                 environment: str = "real", runs_dir: Path | None = None):
+        """environment: real | sim (MuJoCo) | fake (saved image), stored with each episode; runs_dir:
+        where run folders go (default runs/)."""
         self.cfg, self.kin, self.cam_model, self.rect = cfg, kin, cam_model, rect
+        self.environment, self.runs_dir = environment, runs_dir
         self.planner, self.locator, self.rep = planner, locator, reporter
         self.speed = speed_deg_s
         self._gripper_pct = 0.0  # opening when the last photo was taken (dry runs: closed)
@@ -159,7 +163,7 @@ class GraspRunner:
 
     # ------------------------------------------------------------------ helpers
     def _new_run_dir(self, prefix: str = "grasp") -> Path:
-        out = RUNS_DIR / time.strftime(f"{prefix}_%Y%m%d_%H%M%S")
+        out = (self.runs_dir or RUNS_DIR) / time.strftime(f"{prefix}_%Y%m%d_%H%M%S")
         out.mkdir(parents=True, exist_ok=False)
         return out
 
@@ -337,9 +341,10 @@ class GraspRunner:
             raise Abort("cancelled at identification")
 
     # ------------------------------------------------------------------ recording
-    def _start_recording(self, out: Path, arm, camera, log: dict) -> recording.EpisodeRecorder | None:
+    def _start_recording(self, out: Path, arm, camera, log: dict, record: bool) -> recording.EpisodeRecorder | None:
         """Start the episode recorder; a failure is reported but does not block the run."""
-        if not self.cfg.recording.enabled:
+        log["recorded"] = record
+        if not record:
             return None
         rec = recording.EpisodeRecorder(out, arm, camera, self.cfg.recording)
         try:
@@ -357,6 +362,7 @@ class GraspRunner:
             obj = log.get("identified_as") or query
             perception = (yaml.safe_load((CONFIG_DIR / "robot.yaml").read_text()) or {}).get("perception") or {}
             rec.finish({
+                "environment": self.environment,
                 "task": {"type": "pick", "mode": log.get("mode"), "query": query, "object": obj,
                          "instruction": f"pick up the {obj}" if obj else None},
                 "outcome": recording.outcome_of(log.get("result", "error: no result"), rec.events),
@@ -377,12 +383,12 @@ class GraspRunner:
             logger.exception("saving the episode failed")
 
     # ------------------------------------------------------------------ live
-    def run(self, arm, camera, query: str | None, keep: bool = False) -> RunResult:
+    def run(self, arm, camera, query: str | None, keep: bool = False, record: bool | None = None) -> RunResult:
         """Full grasp on the arm. `query` names the object (prompt mode); None = the user clicks it in the
-        live view (click mode, see STEPS_CLICK). Returns with the arm at rest and torque off (after an
+        live view (click mode, see STEPS_CLICK). `record`: save an episode (None = config recording.enabled). Returns with the arm at rest and torque off (after an
         E-stop: torque off wherever the arm is)."""
         out = self._new_run_dir()
-        log: dict = {"query": query, "mode": "prompt" if query else "click",
+        log: dict = {"query": query, "mode": "prompt" if query else "click", "environment": self.environment,
                      "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
         current = {"step": None}
         home_via_scan = True  # until a plan exists; plans are checked for direct relook/lift -> rest paths
@@ -414,7 +420,8 @@ class GraspRunner:
             save()
             return RunResult(out, "declined", log)
 
-        rec = self._start_recording(out, arm, camera, log)
+        rec = self._start_recording(out, arm, camera, log,
+                                    self.cfg.recording.enabled if record is None else record)
         rep = self.rep
         if rec is not None:
             self.rep = _RecordingReporter(rep, rec)

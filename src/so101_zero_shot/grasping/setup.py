@@ -15,7 +15,9 @@ def perception_config() -> dict:
     return yaml.safe_load((CONFIG_DIR / "robot.yaml").read_text()).get("perception") or {}
 
 
-def build_runner_parts() -> dict:
+def build_runner_parts(sim: bool = False) -> dict:
+    """sim: the MuJoCo camera renders from the hand-eye pose, so mask the gripper as seen from there
+    (instead of the pose fitted to the real fingers)."""
     from ..perception.depth import DepthAnything
     from ..perception.gripper_mask import GripperMask
     from ..perception.pointer import VlmPointer
@@ -32,7 +34,8 @@ def build_runner_parts() -> dict:
         Segmenter(pcfg.get("sam_model", "facebook/sam2.1-hiera-small")),
         DepthAnything(pcfg.get("depth_model", "depth-anything/Depth-Anything-V2-Small-hf")),
         rectifier=rect, table_z_m=float(pcfg.get("table_z_m", 0.0)),
-        gripper_mask=GripperMask.load(rect.K, rect.size, cfg.gripper_open_gap_m),
+        gripper_mask=(GripperMask.render(cam_model.T_hand_camera, rect.K, rect.size, cfg.gripper_open_gap_m) if sim
+                      else GripperMask.load(rect.K, rect.size, cfg.gripper_open_gap_m)),
     )
     planner = TopDownPlanner(kin, CollisionChecker(), cam_model, cfg.poses["rest"])
     return {"cfg": cfg, "kin": kin, "cam_model": cam_model, "rect": rect, "planner": planner, "locator": locator}

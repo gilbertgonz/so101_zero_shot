@@ -32,7 +32,8 @@ def main() -> int:
     if not RUNS_DIR.is_dir():
         raise SystemExit(f"{RUNS_DIR} does not exist")
     api.create_repo(REPO_ID, repo_type="dataset", private=True, exist_ok=True)
-    commit = api.upload_folder(repo_id=REPO_ID, repo_type="dataset", folder_path=RUNS_DIR, commit_message=args.message)
+    commit = api.upload_folder(repo_id=REPO_ID, repo_type="dataset", folder_path=RUNS_DIR, commit_message=args.message,
+                               ignore_patterns=["sim/**"])  # simulated runs stay local
     print(f"uploaded {RUNS_DIR} -> https://huggingface.co/datasets/{REPO_ID} ({commit.oid[:10]})")
     return 0
 

@@ -47,6 +47,8 @@ class UiState:
     joints_deg: list | None = None
     gripper_pct: float | None = None
     torque: bool = False
+    environment: str = "real"  # real | sim (MuJoCo) | fake (saved image)
+    recording: bool = True  # record an episode for the next run
     version: int = 0
 
     def snapshot(self) -> dict:
@@ -192,6 +194,14 @@ class ClickRequest(BaseModel):
     view: str = "rect"  # rect | raw
 
 
+class RecordingRequest(BaseModel):
+    enabled: bool
+
+
+class SimResetRequest(BaseModel):
+    shuffle: bool = False
+
+
 class ViewRequest(BaseModel):
     view: str
 
@@ -200,10 +210,17 @@ ROBOT_VIEWS = {"3/4": (135.0, -25.0), "side": (90.0, -5.0), "top": (90.0, -89.0)
 
 
 class Backend:
-    def __init__(self, fake: bool = False, fake_image: Path | None = None):
-        self.fake, self.fake_image = fake, fake_image
+    SIM_SHUFFLE_M = 0.03  # "shuffle" moves each object up to this far and turns it
+
+    def __init__(self, fake: bool = False, fake_image: Path | None = None, sim: bool = False):
+        if fake and sim:
+            raise ValueError("choose fake or sim, not both")
+        self.fake, self.fake_image, self.sim = fake, fake_image, sim
+        self.environment = "sim" if sim else "fake" if fake else "real"
         self.hub = Hub()
         self.cfg = RobotConfig.load()
+        self.hub.update(environment=self.environment, recording=self.cfg.recording.enabled)
+        self.world = None  # SimWorld in sim mode
         self.arm = None
         self.camera = None
         self.runner: GraspRunner | None = None
@@ -245,10 +262,15 @@ class Backend:
                 logger.error("arm disconnect: %s", e)
         if self.camera is not None:
             self.camera.disconnect()
+        if self.world is not None:
+            self.world.close()
         for th in getattr(self, "_loops", []):  # they poll _running every 0.1 s
             th.join(timeout=2.0)
 
     def _connect_hardware(self) -> None:
+        if self.sim:
+            self._start_sim()
+            return
         try:
             if self.fake:
                 from .sim import SimCamera
@@ -273,13 +295,38 @@ class Backend:
         except Exception as e:  # noqa: BLE001
             self.hub.mutate(lambda s: s.status.update(arm=f"error: {e}"))
 
+    def _start_sim(self) -> None:
+        try:
+            from ..mujoco_sim import SimWorld, SimWristCamera, make_mujoco_arm
+            from ..perception.geometry import FisheyeCamera
+
+            world = SimWorld(self.cfg, FisheyeCamera.load())
+            world.start()
+            self.world = world
+            self.camera = SimWristCamera(world)
+            self.arm = make_mujoco_arm(self.cfg, world)
+            self.hub.mutate(lambda s: s.status.update(arm="ok (MuJoCo sim)", camera="ok (MuJoCo sim)"))
+        except Exception as e:  # noqa: BLE001
+            logger.exception("simulation failed to start")
+            self.hub.mutate(lambda s: s.status.update(arm=f"error: {e}", camera=f"error: {e}"))
+
+    def sim_reset(self, shuffle: bool) -> None:
+        if self.world is None:
+            raise HTTPException(400, "not running in simulation")
+        if self.hub.state.busy:
+            raise HTTPException(409, "a run is in progress")
+        self.world.reset(jitter_m=self.SIM_SHUFFLE_M if shuffle else 0.0)
+        self.hub.log("sim: objects " + ("shuffled" if shuffle else "back in place") + ", arm at rest")
+
     def _load_models(self) -> None:
         try:
             from ..grasping.setup import build_runner_parts
 
-            parts = build_runner_parts()
+            parts = build_runner_parts(sim=self.sim)
             self.rect = parts["rect"]
-            self.runner = GraspRunner(**parts, reporter=self.reporter)
+            # Simulated runs (and their episodes) go to runs/sim/, away from the real-robot data.
+            self.runner = GraspRunner(**parts, reporter=self.reporter, environment=self.environment,
+                                      runs_dir=None if self.environment == "real" else RUNS_DIR / "sim")
             self.hub.mutate(lambda s: s.status.update(models="ok"))
         except Exception as e:  # noqa: BLE001
             logger.exception("model loading failed")
@@ -307,7 +354,11 @@ class Backend:
         from ..viz import LiveRenderer
 
         try:
-            r = LiveRenderer(size=(480, 360), open_gap_m=self.cfg.gripper_open_gap_m)
+            if self.sim:  # show the simulation itself: arm and objects
+                from ..mujoco_sim import SIM_SCENE_PATH
+                r = LiveRenderer(size=(480, 360), open_gap_m=self.cfg.gripper_open_gap_m, scene_path=SIM_SCENE_PATH)
+            else:
+                r = LiveRenderer(size=(480, 360), open_gap_m=self.cfg.gripper_open_gap_m)
         except Exception as e:  # noqa: BLE001
             self.hub.log(f"robot view unavailable: {e}")
             return
@@ -321,7 +372,8 @@ class Backend:
             try:
                 r.set_view(*ROBOT_VIEWS.get(self.robot_view, ROBOT_VIEWS["3/4"]))
                 g = s.gripper_pct or 0.0
-                img = r.render(np.array(s.joints_deg), g)
+                world = self.world
+                img = r.render_qpos(world.qpos()) if world is not None else r.render(np.array(s.joints_deg), g)
                 target = s.target_deg
                 if target is not None and s.busy and np.max(np.abs(np.subtract(target, s.joints_deg))) > 2.0:
                     mask = r.arm_mask(np.array(target), g)
@@ -350,15 +402,18 @@ class Backend:
             raise HTTPException(409, "a run is already in progress")
         if self.runner is None or self.arm is None or self.camera is None:
             raise HTTPException(503, f"not ready: {self.hub.state.status}")
+        record = bool(self.hub.state.recording)  # fixed for this run, whatever the toggle does meanwhile
         self.stop_flag.clear()
         self.hub.reset_steps(STEPS if mode == "prompt" else STEPS_CLICK)
         self.hub.update(busy=True, query=query if mode == "prompt" else "", mode=mode, result="", run_dir="",
                         target_deg=None)
-        self.hub.log((f'run: "{query}"' if mode == "prompt" else "run: pick by clicking") + (" (keep)" if keep else ""))
+        self.hub.log((f'run: "{query}"' if mode == "prompt" else "run: pick by clicking") + (" (keep)" if keep else "")
+                     + ("" if record else " (not recorded)"))
 
         def work():
             try:
-                res = self.runner.run(self.arm, self.camera, query if mode == "prompt" else None, keep=keep)
+                res = self.runner.run(self.arm, self.camera, query if mode == "prompt" else None, keep=keep,
+                                      record=record)
                 self.hub.update(result=res.result, run_dir=res.out_dir.name)
             except Exception as e:  # noqa: BLE001 - surface in the UI
                 logger.exception("run crashed")
@@ -447,10 +502,10 @@ class Backend:
             yield f"data: {json.dumps(snap, default=str)}\n\n"
 
 
-def create_app(fake: bool = False, fake_image: Path | None = None) -> FastAPI:
+def create_app(fake: bool = False, fake_image: Path | None = None, sim: bool = False) -> FastAPI:
     from contextlib import asynccontextmanager
 
-    backend = Backend(fake=fake, fake_image=fake_image)
+    backend = Backend(fake=fake, fake_image=fake_image, sim=sim)
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -459,7 +514,6 @@ def create_app(fake: bool = False, fake_image: Path | None = None) -> FastAPI:
         backend.shutdown()
 
     app = FastAPI(title="so101_zero_shot", lifespan=lifespan)
-    app.state.backend = backend
     app.state.backend = backend
 
     @app.get("/", response_class=HTMLResponse)
@@ -507,6 +561,19 @@ def create_app(fake: bool = False, fake_image: Path | None = None) -> FastAPI:
     @app.post("/api/estop")
     def estop():
         backend.estop()
+        return {"ok": True}
+
+    @app.post("/api/recording")
+    def set_recording(req: RecordingRequest):
+        if backend.hub.state.busy:
+            raise HTTPException(409, "a run is in progress; change recording before the next run")
+        backend.hub.update(recording=req.enabled)
+        backend.hub.log("episode recording " + ("on" if req.enabled else "off") + " for the next runs")
+        return {"ok": True}
+
+    @app.post("/api/sim/reset")
+    def sim_reset(req: SimResetRequest):
+        backend.sim_reset(req.shuffle)
         return {"ok": True}
 
     @app.post("/api/robot_view")

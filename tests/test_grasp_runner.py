@@ -117,6 +117,13 @@ def test_full_grasp_holds_and_returns(setup):
     assert any(e["kind"] == "confirm" and e["question"] == "grasp" for e in meta["events"])
 
 
+def test_run_without_recording(setup):
+    parts, arm, cam = setup
+    res = GraspRunner(**parts, reporter=Rep(), speed_deg_s=200).run(arm, cam, "marker", record=False)
+    assert res.result == "held" and res.log["recorded"] is False
+    assert not (res.out_dir / "episode.parquet").exists() and not (res.out_dir / "episode.json").exists()
+
+
 def test_declined_at_start_records_nothing(setup):
     parts, arm, cam = setup
     res = GraspRunner(**parts, reporter=Rep({"start": False}), speed_deg_s=200).run(arm, cam, "marker")

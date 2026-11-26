@@ -197,6 +197,27 @@ Findings
 - The automatic `success` is the gripper load/position check; `scripts/episodes.py label` overrides it.
 - Earlier runs (before this) have stills and grasp.json only.
 
+## 2026-11-26: MuJoCo simulation of the whole stack
+
+- `scripts/ui.py --sim` / `scripts/grasp.py --sim` (mujoco_sim.py, assets/so101/sim_scene.xml): the arm on a
+  table with 5 objects. The real SO101Arm runs on MujocoBus (goal/position/load registers backed by
+  physics; torque off = actuators disabled), the wrist camera is a wide pinhole render remapped through the
+  calibrated fisheye model (~10 fps), rendered from the hand-eye pose so 3D has no calibration error. The
+  gripper mask is rendered from that pose too. Joint ranges widened to the calibrated range (rest is outside
+  the URDF limits); arm links collide only with table/objects; clamp collision = finger-pad boxes (mesh
+  convex hulls blocked the jaws ~4 mm per side). Runs/episodes go to runs/sim/ (environment: sim; not
+  uploaded). UI: Reset scene / Shuffle objects, live view shows the simulated objects.
+- Sim and planner kinematics agree exactly. Shadows cost ~100 ms per frame, so they are off.
+- First results (VLM 2B, same pipeline as real):
+  - blue can (7 cm): found, re-looked, grasped, held, put back.
+  - red cube (3 cm) and marker (1.8 cm): positions within ~1-2 cm, but tops estimated 2-3 cm too high
+    (cube 5.3 cm, marker ~5 cm), so the fingertips stopped at or above the top and missed. The recording
+    shows the cube squeezing out of a 3 mm deep grasp. Same bias as the real robot (tops too close to the
+    camera), larger on rendered images. With the true positions the same planner lifts both (tests).
+  - Click mode: the VLM named the marker "black and white pen".
+- So the height estimate for short objects is the weak link; the sim is a place to work on it with ground
+  truth (object poses are known).
+
 Next
 - More grasps (different objects, positions, orientations) to measure the success rate.
 - VLM check of the after-lift image as a second opinion on "held".

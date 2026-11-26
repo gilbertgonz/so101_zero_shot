@@ -31,6 +31,24 @@ GRIPPER_BODY = "gripper"
 CLAMP_BODIES = ("clamp_right", "clamp_left")
 
 
+def set_pinhole_camera(scene: mujoco.MjvScene, T_world_camera: np.ndarray, K: np.ndarray, size: tuple[int, int],
+                       near_m: float) -> None:
+    """Make the scene's (already updated) cameras an OpenCV-convention pinhole camera at T_world_camera with
+    intrinsics K for an image of `size` (w, h). Call after Renderer.update_scene, before render."""
+    R_gl = T_world_camera[:3, :3] @ np.diag([1.0, -1.0, -1.0])  # OpenGL camera: looks down -z, y up
+    w, h = size
+    for cam in scene.camera:
+        cam.pos[:] = T_world_camera[:3, 3]
+        cam.forward[:] = -R_gl[:, 2]
+        cam.up[:] = R_gl[:, 1]
+        cam.frustum_near = near_m
+        # Pinhole with the principal point at K's (cx, cy).
+        cam.frustum_top = near_m * K[1, 2] / K[1, 1]
+        cam.frustum_bottom = -near_m * (h - 1 - K[1, 2]) / K[1, 1]
+        cam.frustum_width = near_m * (w / 2.0) / K[0, 0]
+        cam.frustum_center = near_m * ((w - 1) / 2.0 - K[0, 2]) / K[0, 0]
+
+
 class GripperRenderer:
     """Segmentation renders of the gripper seen from a camera fixed in the gripper frame.
 
@@ -66,19 +84,7 @@ class GripperRenderer:
         T_wg[:3, :3], T_wg[:3, 3] = self.data.xmat[g].reshape(3, 3), self.data.xpos[g]
         T = T_wg @ T_gripper_camera
         self.renderer.update_scene(self.data, camera=mujoco.MjvCamera())
-        R_gl = T[:3, :3] @ np.diag([1.0, -1.0, -1.0])  # OpenGL camera: looks down -z, y up
-        w, h = self.size
-        near = self.near_clip_m
-        for cam in self.renderer.scene.camera:
-            cam.pos[:] = T[:3, 3]
-            cam.forward[:] = -R_gl[:, 2]
-            cam.up[:] = R_gl[:, 1]
-            cam.frustum_near = near
-            # Pinhole with the principal point at K's (cx, cy).
-            cam.frustum_top = near * self.K[1, 2] / self.K[1, 1]
-            cam.frustum_bottom = -near * (h - 1 - self.K[1, 2]) / self.K[1, 1]
-            cam.frustum_width = near * (w / 2.0) / self.K[0, 0]
-            cam.frustum_center = near * ((w - 1) / 2.0 - self.K[0, 2]) / self.K[0, 0]
+        set_pinhole_camera(self.renderer.scene, T, self.K, self.size, self.near_clip_m)
         seg = self.renderer.render()[..., 0]
         return np.isin(seg, self._clamp_geoms), np.isin(seg, self._gripper_geoms)
 

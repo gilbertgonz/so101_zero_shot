@@ -26,9 +26,17 @@ python3 -m venv .venv
   measures it, names it, and shows what it found and where before asking to grasp it.
 - `scripts/grasp.py "object"`: the same grasp from the terminal (`--dry-run SCENE` plans from a saved image).
 
+### Simulation (no arm needed)
+`scripts/ui.py --sim` (or `scripts/grasp.py --sim "red cube"`) runs the whole stack on a MuJoCo arm on a
+table with five objects (red cube, blue can, yellow ball, black marker, green block;
+`assets/so101/sim_scene.xml`). The real arm code drives simulated servos, the wrist camera is rendered
+through the calibrated fisheye model, and grasps are physics. The UI gets **Reset scene** / **Shuffle objects**
+buttons. Simulated runs and episodes go to `runs/sim/` (not uploaded); `scripts/episodes.py --sim list`.
+
 ## Recorded episodes
-Every run on the arm (UI or terminal, prompt or click) is recorded from the start confirmation until torque
-is off, into its run folder:
+Runs on the arm (UI or terminal, prompt or click) are recorded from the start confirmation until torque
+is off, into their run folder. The UI's **record** checkbox (next to Run) turns it off for the next runs;
+`scripts/grasp.py --no-record` for the terminal; `recording.enabled` in `config/robot.yaml` is the default:
 - `episode.parquet`: one row per sample (10 Hz, `recording:` in `config/robot.yaml`): `timestamp`,
   `observation.images.wrist` (raw fisheye frame, JPEG, 800x600), `observation.state` (5 joints in deg +
   gripper % open), `observation.load` (servo load), `action` (last commanded goal), `phase` (current step),

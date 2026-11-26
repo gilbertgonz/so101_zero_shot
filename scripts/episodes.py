@@ -1,6 +1,6 @@
 """List, filter, label and index the recorded episodes in runs/ (see src/so101_zero_shot/recording.py).
 
-Usage:
+Usage (add --sim before the command for the simulated runs in runs/sim/):
   episodes.py list [--status held] [--mode click] [--object marker] [--success yes|no|unknown]
                    [--attempted] [--since 2026-11-25]
   episodes.py label RUN --success yes|no [--note TEXT]     human verdict (overrides the automatic check)
@@ -55,7 +55,7 @@ def flat(run_dir: Path, m: dict) -> dict:
 
 def select(args) -> list[dict]:
     rows = []
-    for run_dir, m in iter_episodes(RUNS_DIR):
+    for run_dir, m in iter_episodes(args.runs_dir):
         r = flat(run_dir, m)
         if args.status and r["status"] != args.status:
             continue
@@ -89,7 +89,7 @@ def cmd_list(args) -> None:
 def cmd_label(args) -> None:
     run_dir = Path(args.run)
     if not run_dir.is_dir():
-        run_dir = RUNS_DIR / args.run
+        run_dir = args.runs_dir / args.run
     path = run_dir / META_FILE
     if not path.exists():
         sys.exit(f"no {META_FILE} in {run_dir}")
@@ -102,14 +102,14 @@ def cmd_label(args) -> None:
 
 
 def cmd_index(args) -> None:
-    rows = [flat(d, m) for d, m in iter_episodes(RUNS_DIR)]
-    out = RUNS_DIR / "episodes.parquet"
+    rows = [flat(d, m) for d, m in iter_episodes(args.runs_dir)]
+    out = args.runs_dir / "episodes.parquet"
     pq.write_table(pa.Table.from_pylist(rows), out)
     print(f"wrote {out} ({len(rows)} episodes)")
 
 
 def cmd_frames(args) -> None:
-    run_dir = Path(args.run) if Path(args.run).is_dir() else RUNS_DIR / args.run
+    run_dir = Path(args.run) if Path(args.run).is_dir() else args.runs_dir / args.run
     meta, table = load_episode(run_dir)
     images, phases, ts = table[IMAGE_KEY].to_pylist(), table["phase"].to_pylist(), table["timestamp"].to_pylist()
     writer = None
@@ -130,6 +130,7 @@ def cmd_frames(args) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--sim", action="store_true", help="simulated runs (runs/sim/)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     ls = sub.add_parser("list")
     ls.add_argument("--status", help="held | missed | aborted | stopped | estopped | error")
@@ -147,6 +148,7 @@ def main() -> None:
     fr.add_argument("run")
     fr.add_argument("out")
     args = ap.parse_args()
+    args.runs_dir = RUNS_DIR / "sim" if args.sim else RUNS_DIR
     {"list": cmd_list, "label": cmd_label, "index": cmd_index, "frames": cmd_frames}[args.cmd](args)
 
 

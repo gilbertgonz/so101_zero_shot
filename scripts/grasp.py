@@ -12,6 +12,8 @@ Usage:
   grasp.py QUERY                  run on the arm
   grasp.py QUERY --dry-run SCENE  plan from a saved scene (runs/scene_* or 'latest'), render only
   --keep                          keep the object in the gripper (it is still returned to rest)
+  --sim                           MuJoCo simulation instead of the arm (runs go to runs/sim/)
+  --no-record                     do not save an episode for this run (default: config recording.enabled)
 
 Everything is saved to runs/grasp_<time>/. Safety: confirmation before torque and before the grasp;
 Ctrl-C stops the motion and returns to rest; a second Ctrl-C disables torque where the arm is.
@@ -67,11 +69,14 @@ def main() -> None:
     ap.add_argument("--dry-run", metavar="SCENE")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--speed", type=float, default=30.0)
+    ap.add_argument("--sim", action="store_true")
+    ap.add_argument("--no-record", action="store_true")
     args = ap.parse_args()
 
     print("loading models...")
-    parts = build_runner_parts()
-    runner = GraspRunner(**parts, reporter=ConsoleReporter(), speed_deg_s=args.speed)
+    parts = build_runner_parts(sim=args.sim)
+    runner = GraspRunner(**parts, reporter=ConsoleReporter(), speed_deg_s=args.speed,
+                         environment="sim" if args.sim else "real", runs_dir=RUNS_DIR / "sim" if args.sim else None)
 
     if args.dry_run:
         if args.dry_run == "latest":
@@ -86,17 +91,27 @@ def main() -> None:
         return
 
     cfg = parts["cfg"]
-    camera = cfg.make_camera()
-    camera.connect()
-    arm = cfg.make_arm()
-    arm.connect(enable_torque=False)
+    world = None
+    if args.sim:
+        from so101_zero_shot.mujoco_sim import SimWorld, SimWristCamera, make_mujoco_arm
+
+        world = SimWorld(cfg, parts["cam_model"])
+        world.start()
+        camera, arm = SimWristCamera(world), make_mujoco_arm(cfg, world)
+    else:
+        camera = cfg.make_camera()
+        camera.connect()
+        arm = cfg.make_arm()
+        arm.connect(enable_torque=False)
     try:
-        runner.run(arm, camera, args.query, keep=args.keep)
+        runner.run(arm, camera, args.query, keep=args.keep, record=False if args.no_record else None)
     except KeyboardInterrupt:
         print("\nsecond interrupt: disabling torque now")
     finally:
         arm.disconnect(disable_torque=True)
         camera.disconnect()
+        if world is not None:
+            world.close()
         print("torque off")
 
 

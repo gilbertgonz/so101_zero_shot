@@ -89,6 +89,7 @@
   <span class="chip" id="chip-arm">arm</span>
   <span class="chip" id="chip-camera">camera</span>
   <span class="chip" id="chip-torque">torque</span>
+  <span class="chip warn" id="chip-env" style="display:none"></span>
   <span class="spacer"></span>
   <span id="result" class="result"></span>
 </header>
@@ -110,10 +111,16 @@
       <div class="controls">
         <input id="prompt" type="text" placeholder='What should it pick up? e.g. "black dry erase marker"' autocomplete="off">
         <label class="keep"><input type="checkbox" id="keep"> keep holding</label>
+        <label class="keep" title="Save this run as an episode (camera frames + robot state + outcome)"><input type="checkbox" id="record"> record</label>
         <button class="btn run" id="run">Run</button>
         <button class="btn pickbtn" id="pickbtn" title="Move to the scan pose, then click the object in the camera view">Pick by clicking</button>
         <button class="btn stop" id="stop" title="Hold, then return to rest. Press again while returning to cut torque where it is.">Stop</button>
         <button class="btn estop" id="estop" title="Disable torque immediately: the arm drops onto its stops.">E-STOP</button>
+      </div>
+      <div class="controls" id="simcontrols" style="display:none">
+        <span class="chip warn">MuJoCo simulation</span>
+        <button class="btn" id="simreset" title="Objects back to their starting places, arm to rest">Reset scene</button>
+        <button class="btn" id="simshuffle" title="Objects moved up to 3 cm and turned at random, arm to rest">Shuffle objects</button>
       </div>
     </div>
   </section>
@@ -182,12 +189,18 @@ function render(s) {
   chip("chip-camera", "camera", s.status.camera);
   chip("chip-torque", "torque", s.torque ? "on" : "off");
   $("chip-torque").className = "chip " + (s.torque ? "warn" : "ok");
+  $("chip-env").style.display = s.environment === "real" ? "none" : "";
+  $("chip-env").textContent = s.environment === "sim" ? "SIMULATION" : "FAKE (saved image)";
+  $("simcontrols").style.display = s.environment === "sim" ? "" : "none";
+  $("simreset").disabled = $("simshuffle").disabled = s.busy;
 
   const ready = s.status.models === "ok" && String(s.status.arm).startsWith("ok") && String(s.status.camera).startsWith("ok");
   $("run").disabled = s.busy || !ready;
   $("pickbtn").disabled = s.busy || !ready;
   $("stop").disabled = !s.busy;
   $("prompt").disabled = s.busy;
+  $("record").checked = !!s.recording;
+  $("record").disabled = s.busy;
   $("query").textContent = s.query ? `"${s.query}"` : (s.mode === "click" && (s.busy || s.result) ? "(picked by clicking)" : "");
   const wrap = document.querySelector(".imgwrap");
   wrap.classList.toggle("picking", !!s.pick);
@@ -251,6 +264,9 @@ $("run").addEventListener("click", () => post("/api/run", { query: $("prompt").v
 $("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !$("run").disabled) $("run").click(); });
 $("stop").addEventListener("click", () => post("/api/stop"));
 $("estop").addEventListener("click", () => post("/api/estop"));
+$("record").addEventListener("change", (e) => post("/api/recording", { enabled: e.target.checked }));
+$("simreset").addEventListener("click", () => post("/api/sim/reset", { shuffle: false }));
+$("simshuffle").addEventListener("click", () => post("/api/sim/reset", { shuffle: true }));
 $("confirm-actions").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-v]");
   if (b && confirmId) post("/api/confirm", { id: confirmId, answer: b.dataset.v });
