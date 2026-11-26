@@ -61,3 +61,28 @@ def test_workspace_check():
     for bad in ([0.5, 0.0, 0.02], [0.2, 0.0, -0.01], [0.2, 0.3, 0.02], [np.nan, 0, 0]):
         with pytest.raises(ValueError):
             cfg.check_in_workspace(np.array(bad))
+
+
+def test_ik_results_pass_the_arm_limit_check():
+    """Regression: plans that reach a joint limit came back 1e-14 deg outside it after the rad -> deg
+    conversion (wrist_flex 104.52747252747254 vs 104.52747252747253) and the arm refused to move."""
+    from so101_zero_shot.grasping.topdown import GraspPlanningError, TopDownPlanner
+    from so101_zero_shot.kinematics.collision import CollisionChecker
+    from so101_zero_shot.perception.geometry import FisheyeCamera
+    from so101_zero_shot.ui.sim import make_sim_arm
+
+    cfg = RobotConfig.load()
+    kin = cfg.make_kinematics()
+    arm = make_sim_arm(cfg)
+    planner = TopDownPlanner(kin, CollisionChecker(), FisheyeCamera.load(), cfg.poses["rest"])
+    at_limit = 0
+    for x in np.linspace(0.14, 0.30, 5):
+        for y in np.linspace(-0.12, 0.12, 4):
+            try:
+                plan = planner.plan_grasp(np.array([x, y, 0.02]), None, cfg.poses["scan"])
+            except GraspPlanningError:
+                continue
+            for q in (plan.pregrasp_deg, plan.grasp_deg, plan.lift_deg):
+                arm.check_limits(q)  # raises if any joint is outside, by any amount
+                at_limit += any(abs(v - b) < 1e-9 for v, m in zip(q, arm.joint_limits) for b in arm.joint_limits[m])
+    assert at_limit > 0  # the grid does include poses at a limit

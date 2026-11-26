@@ -64,6 +64,9 @@ class SO101Kinematics:
         else:
             self.robot = placo.RobotWrapper(str(urdf_path), placo.Flags.ignore_collisions)
         self.joint_names = list(ARM_JOINTS)
+        lim = joint_limits_deg or {}
+        self._lo = np.array([lim.get(j, (-np.inf, np.inf))[0] for j in self.joint_names], dtype=float)
+        self._hi = np.array([lim.get(j, (-np.inf, np.inf))[1] for j in self.joint_names], dtype=float)
         if joint_limits_deg:
             for j, (lo, hi) in joint_limits_deg.items():
                 if j in self.joint_names:
@@ -76,7 +79,13 @@ class SO101Kinematics:
         self.robot.update_kinematics()
 
     def _get(self) -> np.ndarray:
-        return np.rad2deg([self.robot.get_joint(n) for n in self.joint_names])
+        q = np.rad2deg([self.robot.get_joint(n) for n in self.joint_names])
+        # The solver keeps joints inside the limits in radians; converting back to degrees can land a
+        # rounding error outside (104.52747252747254 vs a 104.52747252747253 limit), which the arm's limit
+        # check then rejects. Snap such tiny overshoots onto the limit; real violations are left as they are.
+        tol = 1e-6
+        q = np.where((q > self._hi) & (q <= self._hi + tol), self._hi, q)
+        return np.where((q < self._lo) & (q >= self._lo - tol), self._lo, q)
 
     def fk(self, joints_deg: np.ndarray, frame: str = TIP_FRAME) -> np.ndarray:
         """4x4 pose of `frame` in the base frame."""
