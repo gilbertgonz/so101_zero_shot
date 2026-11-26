@@ -126,6 +126,9 @@ class SO101Arm:
         self.gripper_inverted = gripper_inverted
         self.stop_event = threading.Event()
         self.estopped = False  # set by emergency_torque_off(); cleared by clear_stop()
+        # Last goal sent per motor (5 joints in deg, gripper in %), NaN until commanded; for recording.
+        self._command = np.full(len(MOTOR_IDS), np.nan)
+        self._command_lock = threading.Lock()
 
     # ------------------------------------------------------------------ lifecycle
     def connect(self, enable_torque: bool = True) -> None:
@@ -242,12 +245,34 @@ class SO101Arm:
         self.stop_event.set()
         self.bus.disable_torque(num_retry=5)
 
+    def last_command(self) -> np.ndarray:
+        """Last goal sent, shape (6,): 5 joints (deg) then gripper (%); NaN for motors not yet commanded."""
+        with self._command_lock:
+            return self._command.copy()
+
+    def read_state(self, num_retry: int = 0) -> tuple[np.ndarray, np.ndarray]:
+        """(position, load), shape (6,) each, in two bus transactions: 5 joints (deg) + gripper (%), and
+        Present_Load (0.1 % of max torque, signed) per motor. No retries by default so a recorder never
+        holds the bus long. Raises FeetechError."""
+        names = list(MOTOR_IDS)
+        ticks = self.bus.sync_read("Present_Position", names, num_retry=num_retry)
+        load = self.bus.sync_read("Present_Load", names, num_retry=num_retry)
+        pos = [self.ticks_to_deg(m, ticks[m]) for m in ARM_JOINTS] + [self.ticks_to_gripper(ticks[GRIPPER])]
+        return np.array(pos), np.array([float(load[m]) for m in names])
+
     # ------------------------------------------------------------------ commands
+    def _note_command(self, goal_ticks: dict[str, int]) -> None:
+        with self._command_lock:
+            for m, t in goal_ticks.items():
+                i = list(MOTOR_IDS).index(m)
+                self._command[i] = self.ticks_to_gripper(t) if m == GRIPPER else self.ticks_to_deg(m, t)
+
     def _send(self, joints_deg: np.ndarray, gripper: float | None) -> None:
         goal = {m: self.deg_to_ticks(m, q) for m, q in zip(ARM_JOINTS, joints_deg)}
         if gripper is not None:
             goal[GRIPPER] = self.gripper_to_ticks(gripper)
         self.bus.sync_write("Goal_Position", goal)
+        self._note_command(goal)
 
     def move_to(
         self,
@@ -327,14 +352,18 @@ class SO101Arm:
         n = max(int(duration_s * self.control_hz), 1)
         for i in range(1, n + 1):
             self._check_stop()
-            self.bus.sync_write("Goal_Position", {GRIPPER: self.gripper_to_ticks(start + (pct - start) * i / n)})
+            goal = {GRIPPER: self.gripper_to_ticks(start + (pct - start) * i / n)}
+            self.bus.sync_write("Goal_Position", goal)
+            self._note_command(goal)
             time.sleep(1.0 / self.control_hz)
         time.sleep(0.3)
         return self.read_gripper()
 
     def hold(self) -> None:
         """Re-command the present position (stops any motion in progress)."""
-        self.bus.sync_write("Goal_Position", self.bus.sync_read("Present_Position"))
+        present = self.bus.sync_read("Present_Position")
+        self.bus.sync_write("Goal_Position", present)
+        self._note_command(present)
 
 
 __all__ = [

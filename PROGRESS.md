@@ -182,6 +182,21 @@ Findings
     below the table, but its height (~0 cm) is still not trustworthy this close to the fingers.
   - Scene 102546's marker (mostly hidden behind the fingers) is now refused instead of measured at -1.6 cm.
 
+## 2026-11-26: Episode recording
+
+- Every run on the arm is now recorded (recording.py, `recording:` in robot.yaml), from the start
+  confirmation until torque is off, including aborted, stopped and E-stopped runs (declined-at-start and
+  dry runs have no motion and are not recorded). Per run folder: `episode.parquet` (10 Hz rows: raw fisheye
+  frame as 800x600 JPEG, measured joints + gripper, servo loads, last commanded goal, current step) and
+  `episode.json` (task, outcome, human label slot, grasp plan, step events and operator answers, lens
+  calibration scaled to the stored frames, git commit). LeRobot-style column names, `datasets` Image layout
+  (checked: `load_dataset("parquet")` decodes the frames). scripts/episodes.py lists/filters/labels/indexes.
+- The recorder thread reads the bus with no retries (two sync reads per sample) so it cannot hold the bus
+  for long; a failed read keeps the row with NaN state (`state_ok` false). Never fails the run.
+- About 0.5-0.9 MB/s, ~60 MB per 90 s grasp. Not yet run on the real arm.
+- The automatic `success` is the gripper load/position check; `scripts/episodes.py label` overrides it.
+- Earlier runs (before this) have stills and grasp.json only.
+
 Next
 - More grasps (different objects, positions, orientations) to measure the success rate.
 - VLM check of the after-lift image as a second opinion on "held".

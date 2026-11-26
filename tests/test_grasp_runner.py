@@ -14,6 +14,7 @@ from so101_zero_shot.perception.depth import TableFit
 from so101_zero_shot.perception.geometry import FisheyeCamera, Rectifier
 from so101_zero_shot.perception.locate import ObjectEstimate, PerceptionError
 from so101_zero_shot.perception.pointer import Pointing
+from so101_zero_shot.recording import load_episode
 from so101_zero_shot.ui.sim import SimCamera, make_sim_arm
 
 
@@ -109,6 +110,25 @@ def test_full_grasp_holds_and_returns(setup):
     assert at_rest(parts, arm) and not arm.bus.torque
     assert arm.read_gripper() < 2.0  # closed again after putting the object back
     assert (res.out_dir / "grasp.json").exists()
+    meta, table = load_episode(res.out_dir)
+    assert meta["outcome"]["status"] == "held" and meta["outcome"]["success"] is True
+    assert meta["outcome"]["grasp_attempted"] and meta["task"]["instruction"] == "pick up the marker"
+    assert table.num_rows == meta["num_frames"] > 0 and "home" in table["phase"].to_pylist()
+    assert any(e["kind"] == "confirm" and e["question"] == "grasp" for e in meta["events"])
+
+
+def test_declined_at_start_records_nothing(setup):
+    parts, arm, cam = setup
+    res = GraspRunner(**parts, reporter=Rep({"start": False}), speed_deg_s=200).run(arm, cam, "marker")
+    assert res.result == "declined" and not (res.out_dir / "episode.parquet").exists()
+
+
+def test_aborted_run_is_recorded_with_reason(setup):
+    parts, arm, cam = setup
+    res = GraspRunner(**parts, reporter=Rep({"grasp": False}), speed_deg_s=200).run(arm, cam, "marker")
+    meta, _ = load_episode(res.out_dir)
+    assert meta["outcome"]["status"] == "aborted" and meta["outcome"]["reason"] == "grasp declined"
+    assert meta["outcome"]["success"] is None and not meta["outcome"]["grasp_attempted"]
 
 
 def test_declined_grasp_returns_to_rest(setup):

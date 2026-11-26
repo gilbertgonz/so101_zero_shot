@@ -37,6 +37,15 @@ camera:
   height: 1200
   fps: 20
 
+# Episode recording (src/so101_zero_shot/recording.py): every run on the arm is saved as
+# runs/<run>/episode.parquet (wrist frames + joint state/load/commands by timestamp) + episode.json (task,
+# outcome). 10 Hz at 800x600 JPEG is about 0.5-0.9 MB/s (~60 MB for a 90 s grasp).
+recording:
+  enabled: true
+  fps: 10
+  image_width: 800   # raw frames are 1600x1200; stored resized (aspect kept), intrinsics scaled in episode.json
+  jpeg_quality: 85
+
 # Named joint poses (deg, URDF convention): [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll].
 poses:
   # Folded on its stops reads about [-2.5, -108, 90, 48, -2.5]; hold a few deg off the stops.

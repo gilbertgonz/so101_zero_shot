@@ -17,12 +17,14 @@ from typing import Protocol
 
 import cv2
 import numpy as np
+import yaml
 
-from ..config import RUNS_DIR, RobotConfig
+from ..config import CONFIG_DIR, RUNS_DIR, RobotConfig
 from ..hardware import MotionStopped
 from ..kinematics import SO101Kinematics
 from ..perception.geometry import FisheyeCamera, Rectifier
 from ..perception.locate import Locator, ObjectEstimate, PerceptionError, draw_debug
+from .. import recording
 from .feedback import is_holding, read_grip
 from .topdown import GraspPlan, GraspPlanningError, TopDownPlanner, grasp_height, object_axis_xy
 
@@ -83,6 +85,38 @@ class RunResult:
 
 def _jsonable(o):
     return np.asarray(o).tolist()
+
+
+class _RecordingReporter:
+    """Passes everything to the real reporter and notes steps and operator answers in the episode."""
+
+    def __init__(self, rep: Reporter, rec: recording.EpisodeRecorder):
+        self.rep, self.rec = rep, rec
+
+    def step(self, step_id, status, message="", detail=None, images=None):
+        if status == "active":
+            self.rec.set_phase(step_id)
+        self.rec.event("step", step=step_id, status=status, message=message or None)
+        self.rep.step(step_id, status, message, detail, images)
+
+    def log(self, message):
+        self.rec.event("log", message=message)
+        self.rep.log(message)
+
+    def confirm(self, kind, prompt, images=None):
+        answer = self.rep.confirm(kind, prompt, images)
+        self.rec.event("confirm", question=kind, answer=bool(answer))
+        return answer
+
+    def choose(self, kind, title, prompt, options, images=None):
+        answer = self.rep.choose(kind, title, prompt, options, images)
+        self.rec.event("choose", question=kind, answer=answer)
+        return answer
+
+    def pick(self, prompt):
+        click = self.rep.pick(prompt)
+        self.rec.event("click", px=None if click is None else [round(float(v), 1) for v in click])
+        return click
 
 
 def overlay_grasp(img: np.ndarray, est: ObjectEstimate, rect: Rectifier, target: np.ndarray,
@@ -302,6 +336,46 @@ class GraspRunner:
                 continue
             raise Abort("cancelled at identification")
 
+    # ------------------------------------------------------------------ recording
+    def _start_recording(self, out: Path, arm, camera, log: dict) -> recording.EpisodeRecorder | None:
+        """Start the episode recorder; a failure is reported but does not block the run."""
+        if not self.cfg.recording.enabled:
+            return None
+        rec = recording.EpisodeRecorder(out, arm, camera, self.cfg.recording)
+        try:
+            rec.start()
+        except Exception as e:  # noqa: BLE001
+            log["recording_error"] = repr(e)
+            self.rep.log(f"WARNING: episode recording failed to start, this run is not recorded: {e!r}")
+            logger.exception("episode recorder failed to start")
+            return None
+        return rec
+
+    def _finish_recording(self, rec: recording.EpisodeRecorder, log: dict, query: str | None) -> None:
+        try:
+            rec.stop()
+            obj = log.get("identified_as") or query
+            perception = (yaml.safe_load((CONFIG_DIR / "robot.yaml").read_text()) or {}).get("perception") or {}
+            rec.finish({
+                "task": {"type": "pick", "mode": log.get("mode"), "query": query, "object": obj,
+                         "instruction": f"pick up the {obj}" if obj else None},
+                "outcome": recording.outcome_of(log.get("result", "error: no result"), rec.events),
+                "label": {"success": None, "note": None, "labeled_at": None},
+                "grasp": log,
+                "robot": {"type": "so101_follower", "gripper": "roboninecom SO-ARM100-101-102 parallel gripper",
+                          "joint_offsets_deg": self.cfg.joint_offsets_deg, "tip_xyz_m": self.cfg.tip_xyz_m,
+                          "gripper_open_gap_m": self.cfg.gripper_open_gap_m, "workspace_m": self.cfg.workspace,
+                          "speed_deg_s": self.speed, "poses_deg": {"rest": self.rest, "scan": self.scan}},
+                "perception": perception,
+                "software": recording.git_version(),
+            }, cam_model=self.cam_model)
+            self.rep.log(f"recorded {rec.num_frames} samples ({rec.frames_with_image} with images) to "
+                         f"{rec.out_dir.name}/{recording.EPISODE_FILE}"
+                         + (f"; WRITE ERROR {rec.write_error}" if rec.write_error else ""))
+        except Exception as e:  # noqa: BLE001 - the run itself is over; report and move on
+            self.rep.log(f"WARNING: saving the episode failed: {e!r}")
+            logger.exception("saving the episode failed")
+
     # ------------------------------------------------------------------ live
     def run(self, arm, camera, query: str | None, keep: bool = False) -> RunResult:
         """Full grasp on the arm. `query` names the object (prompt mode); None = the user clicks it in the
@@ -340,134 +414,143 @@ class GraspRunner:
             save()
             return RunResult(out, "declined", log)
 
-        arm.clear_stop()
-        arm.bus.sync_write("Goal_Position", arm.bus.sync_read("Present_Position"))
-        arm.bus.enable_torque()
+        rec = self._start_recording(out, arm, camera, log)
+        rep = self.rep
+        if rec is not None:
+            self.rep = _RecordingReporter(rep, rec)
         try:
-            try:
-                begin("home", self.rest)
-                arm.move_to(self.rest, gripper=0.0, speed_deg_s=self.speed)
-                self.rep.step("home", "done")
-
-                if query:
-                    begin("coarse", self.scan)
-                    img, q = snap(self.scan, "coarse")
-                    est, _ = self._locate(img, q, query, out, "coarse")
-                    name = query
-                    self.rep.step("coarse", "done", detail=self._est_detail(est), images=[out / "coarse_locate.png"])
-                else:
-                    begin("scan", self.scan)
-                    arm.move_to(self.scan, speed_deg_s=self.speed, settle_timeout_s=3.0)
-                    self.rep.step("scan", "done")
-                    est, name, q = self._pick_and_identify(arm, camera, snap, out, log, begin)
-                    log["identified_as"] = name
-
-                begin("relook")
-                try:
-                    relook = self.planner.plan_relook(est.center_base * [1, 1, 0], q)
-                except GraspPlanningError as e:
-                    raise Abort(str(e)) from e
-                self.rep.step("relook", "active", detail={"target_deg": [round(float(v), 1) for v in relook]})
-                img, q = snap(relook, "relook")
-                est, dbg, how = self._relocate(img, q, name, est, out, "relook")
-                self.rep.step("relook", "done", detail={**self._est_detail(est), "found_by": how},
-                              images=[out / "relook_locate.png"])
-
-                begin("plan")
-                plan, p = self._plan(est, q, dbg, out, "relook")
-                cv2.imwrite(str(out / "plan.png"), render_plan([
-                    ("pregrasp (open)", plan.pregrasp_deg, OPEN_PCT), ("grasp", plan.grasp_deg, OPEN_PCT),
-                    ("lift (closed)", plan.lift_deg, 0.0)]))
-                log["plan"] = p["raw"]
-                save()
-                images = [out / "relook_grasp_overlay.jpg", out / "plan.png"]
-                self.rep.step("plan", "done", detail=p["detail"], images=images)
-                home_via_scan = False
-
-                begin("approve")
-                if not self.rep.confirm("grasp", "Grasp? Yellow = fingertip point, red = jaw closing line, "
-                                                 "blue = object axis.", images):
-                    raise Abort("grasp declined")
-                self.rep.step("approve", "done")
-
-                begin("pregrasp", plan.pregrasp_deg)
-                arm.move_to(plan.pregrasp_deg, gripper=OPEN_PCT, speed_deg_s=self.speed, settle_timeout_s=3.0)
-                self.rep.step("pregrasp", "done")
-
-                begin("descend", plan.grasp_deg)
-                arm.move_to(plan.grasp_deg, speed_deg_s=DESCEND_SPEED, settle_timeout_s=3.0)
-                tip = self.kin.fk(arm.read_joints())[:3, 3]
-                log["grasp_tip_measured_m"] = tip
-                self.rep.step("descend", "done", detail={"fingertips_cm": [round(float(v) * 100, 1) for v in tip]})
-
-                begin("close")
-                arm.set_gripper(0.0, duration_s=1.0)
-                cpos, cload = read_grip(arm)
-                self.rep.step("close", "done", detail={"opening_pct": round(cpos, 1), "load": cload,
-                                                       "squeezing": is_holding(cpos, cload)})
-
-                begin("lift", plan.lift_deg)
-                arm.move_to(plan.lift_deg, speed_deg_s=DESCEND_SPEED, settle_timeout_s=3.0)
-                lpos, lload = read_grip(arm)
-                held = is_holding(lpos, lload)
-                cv2.imwrite(str(out / "after_lift.jpg"), camera.read_fresh(0.3))
-                log.update(gripper_after_close={"open_pct": cpos, "load": cload},
-                           gripper_after_lift={"open_pct": lpos, "load": lload}, held=held)
-                save()
-                verdict = "HOLDING the object" if held else "MISSED (jaws closed on nothing)"
-                self.rep.step("lift", "done" if held else "failed", verdict,
-                              {"opening_pct": round(lpos, 1), "load": lload, "held": held}, [out / "after_lift.jpg"])
-
-                if held and not keep:
-                    begin("place", plan.grasp_deg)
-                    arm.move_to(plan.grasp_deg, speed_deg_s=DESCEND_SPEED, settle_timeout_s=3.0)
-                    arm.set_gripper(OPEN_PCT, duration_s=0.8)
-                    arm.move_to(plan.lift_deg, speed_deg_s=DESCEND_SPEED, settle_timeout_s=3.0)
-                    arm.set_gripper(0.0, duration_s=0.6)
-                    self.rep.step("place", "done")
-                else:
-                    self.rep.step("place", "skipped", "kept in the gripper" if held else "nothing to put back")
-                if not held:
-                    arm.set_gripper(0.0, duration_s=0.6)
-                log["result"] = "held" if held else "missed"
-            except Abort as e:
-                self.rep.step(current["step"], "failed", str(e))
-                log["result"] = f"aborted: {e}"
-            except (MotionStopped, KeyboardInterrupt):
-                if getattr(arm, "estopped", False):
-                    raise
-                self.rep.step(current["step"], "stopped", "stopped by user")
-                log["result"] = "stopped"
-            except Exception as e:
-                if getattr(arm, "estopped", False):
-                    raise MotionStopped("emergency stop") from e
-                self.rep.step(current["step"], "failed", repr(e))
-                log["result"] = f"error: {e!r}"
-                home_via_scan = True  # unknown state: go up first
-                logger.exception("grasp run failed")
-            save()
-            # Return to rest. A stop request that ended the run above is consumed here, so only a stop
-            # pressed *during* the return cuts torque where the arm is. After an E-stop, do not move again.
-            if getattr(arm, "estopped", False):
-                raise MotionStopped("emergency stop")
             arm.clear_stop()
-            begin("return", self.rest)
-            if home_via_scan and current["step"] != "home":
-                arm.move_to(self.scan, speed_deg_s=min(self.speed, 30.0), settle_timeout_s=3.0)
-            arm.move_to(self.rest, speed_deg_s=min(self.speed, 30.0), settle_timeout_s=3.0)
-            self.rep.step("return", "done")
-        except (MotionStopped, KeyboardInterrupt):
-            est = getattr(arm, "estopped", False)
-            log["result"] = "estopped" if est else log.get("result", "stopped")
-            if current["step"]:
-                self.rep.step(current["step"], "stopped", "E-STOP: torque off" if est else
-                              "stopped again: torque off where the arm is")
-            self.rep.log("E-STOP: torque off" if est else "stopped while returning: torque disabled where the arm is")
-        finally:
+            arm.hold()
+            arm.bus.enable_torque()
             try:
-                arm.bus.disable_torque(num_retry=5)
-            except Exception as e:  # noqa: BLE001 - report, the caller still disconnects
-                self.rep.log(f"failed to disable torque: {e!r}")
-            save()
+                try:
+                    begin("home", self.rest)
+                    arm.move_to(self.rest, gripper=0.0, speed_deg_s=self.speed)
+                    self.rep.step("home", "done")
+
+                    if query:
+                        begin("coarse", self.scan)
+                        img, q = snap(self.scan, "coarse")
+                        est, _ = self._locate(img, q, query, out, "coarse")
+                        name = query
+                        self.rep.step("coarse", "done", detail=self._est_detail(est), images=[out / "coarse_locate.png"])
+                    else:
+                        begin("scan", self.scan)
+                        arm.move_to(self.scan, speed_deg_s=self.speed, settle_timeout_s=3.0)
+                        self.rep.step("scan", "done")
+                        est, name, q = self._pick_and_identify(arm, camera, snap, out, log, begin)
+                        log["identified_as"] = name
+
+                    begin("relook")
+                    try:
+                        relook = self.planner.plan_relook(est.center_base * [1, 1, 0], q)
+                    except GraspPlanningError as e:
+                        raise Abort(str(e)) from e
+                    self.rep.step("relook", "active", detail={"target_deg": [round(float(v), 1) for v in relook]})
+                    img, q = snap(relook, "relook")
+                    est, dbg, how = self._relocate(img, q, name, est, out, "relook")
+                    self.rep.step("relook", "done", detail={**self._est_detail(est), "found_by": how},
+                                  images=[out / "relook_locate.png"])
+
+                    begin("plan")
+                    plan, p = self._plan(est, q, dbg, out, "relook")
+                    cv2.imwrite(str(out / "plan.png"), render_plan([
+                        ("pregrasp (open)", plan.pregrasp_deg, OPEN_PCT), ("grasp", plan.grasp_deg, OPEN_PCT),
+                        ("lift (closed)", plan.lift_deg, 0.0)]))
+                    log["plan"] = p["raw"]
+                    save()
+                    images = [out / "relook_grasp_overlay.jpg", out / "plan.png"]
+                    self.rep.step("plan", "done", detail=p["detail"], images=images)
+                    home_via_scan = False
+
+                    begin("approve")
+                    if not self.rep.confirm("grasp", "Grasp? Yellow = fingertip point, red = jaw closing line, "
+                                                     "blue = object axis.", images):
+                        raise Abort("grasp declined")
+                    self.rep.step("approve", "done")
+
+                    begin("pregrasp", plan.pregrasp_deg)
+                    arm.move_to(plan.pregrasp_deg, gripper=OPEN_PCT, speed_deg_s=self.speed, settle_timeout_s=3.0)
+                    self.rep.step("pregrasp", "done")
+
+                    begin("descend", plan.grasp_deg)
+                    arm.move_to(plan.grasp_deg, speed_deg_s=DESCEND_SPEED, settle_timeout_s=3.0)
+                    tip = self.kin.fk(arm.read_joints())[:3, 3]
+                    log["grasp_tip_measured_m"] = tip
+                    self.rep.step("descend", "done", detail={"fingertips_cm": [round(float(v) * 100, 1) for v in tip]})
+
+                    begin("close")
+                    arm.set_gripper(0.0, duration_s=1.0)
+                    cpos, cload = read_grip(arm)
+                    self.rep.step("close", "done", detail={"opening_pct": round(cpos, 1), "load": cload,
+                                                           "squeezing": is_holding(cpos, cload)})
+
+                    begin("lift", plan.lift_deg)
+                    arm.move_to(plan.lift_deg, speed_deg_s=DESCEND_SPEED, settle_timeout_s=3.0)
+                    lpos, lload = read_grip(arm)
+                    held = is_holding(lpos, lload)
+                    cv2.imwrite(str(out / "after_lift.jpg"), camera.read_fresh(0.3))
+                    log.update(gripper_after_close={"open_pct": cpos, "load": cload},
+                               gripper_after_lift={"open_pct": lpos, "load": lload}, held=held)
+                    save()
+                    verdict = "HOLDING the object" if held else "MISSED (jaws closed on nothing)"
+                    self.rep.step("lift", "done" if held else "failed", verdict,
+                                  {"opening_pct": round(lpos, 1), "load": lload, "held": held}, [out / "after_lift.jpg"])
+
+                    if held and not keep:
+                        begin("place", plan.grasp_deg)
+                        arm.move_to(plan.grasp_deg, speed_deg_s=DESCEND_SPEED, settle_timeout_s=3.0)
+                        arm.set_gripper(OPEN_PCT, duration_s=0.8)
+                        arm.move_to(plan.lift_deg, speed_deg_s=DESCEND_SPEED, settle_timeout_s=3.0)
+                        arm.set_gripper(0.0, duration_s=0.6)
+                        self.rep.step("place", "done")
+                    else:
+                        self.rep.step("place", "skipped", "kept in the gripper" if held else "nothing to put back")
+                    if not held:
+                        arm.set_gripper(0.0, duration_s=0.6)
+                    log["result"] = "held" if held else "missed"
+                except Abort as e:
+                    self.rep.step(current["step"], "failed", str(e))
+                    log["result"] = f"aborted: {e}"
+                except (MotionStopped, KeyboardInterrupt):
+                    if getattr(arm, "estopped", False):
+                        raise
+                    self.rep.step(current["step"], "stopped", "stopped by user")
+                    log["result"] = "stopped"
+                except Exception as e:
+                    if getattr(arm, "estopped", False):
+                        raise MotionStopped("emergency stop") from e
+                    self.rep.step(current["step"], "failed", repr(e))
+                    log["result"] = f"error: {e!r}"
+                    home_via_scan = True  # unknown state: go up first
+                    logger.exception("grasp run failed")
+                save()
+                # Return to rest. A stop request that ended the run above is consumed here, so only a stop
+                # pressed *during* the return cuts torque where the arm is. After an E-stop, do not move again.
+                if getattr(arm, "estopped", False):
+                    raise MotionStopped("emergency stop")
+                arm.clear_stop()
+                begin("return", self.rest)
+                if home_via_scan and current["step"] != "home":
+                    arm.move_to(self.scan, speed_deg_s=min(self.speed, 30.0), settle_timeout_s=3.0)
+                arm.move_to(self.rest, speed_deg_s=min(self.speed, 30.0), settle_timeout_s=3.0)
+                self.rep.step("return", "done")
+            except (MotionStopped, KeyboardInterrupt):
+                est = getattr(arm, "estopped", False)
+                log["result"] = "estopped" if est else log.get("result", "stopped")
+                if current["step"]:
+                    self.rep.step(current["step"], "stopped", "E-STOP: torque off" if est else
+                                  "stopped again: torque off where the arm is")
+                self.rep.log("E-STOP: torque off" if est else "stopped while returning: torque disabled where the arm is")
+            finally:
+                try:
+                    arm.bus.disable_torque(num_retry=5)
+                except Exception as e:  # noqa: BLE001 - report, the caller still disconnects
+                    self.rep.log(f"failed to disable torque: {e!r}")
+                save()
+        finally:
+            self.rep = rep
+            if rec is not None:
+                self._finish_recording(rec, log, query)
         self.rep.log(f"result: {log['result']} ({out.name})")
         return RunResult(out, log["result"], log)

@@ -24,6 +24,31 @@ def _tip_xyz(v) -> tuple[float, float, float] | None:
     return tuple(float(x) for x in v)
 
 
+@dataclass(frozen=True)
+class RecordingConfig:
+    enabled: bool = True
+    fps: float = 10.0
+    image_width: int = 800  # frames are stored resized to this width (aspect kept); raw is 1600x1200
+    jpeg_quality: int = 85
+
+    def __post_init__(self):
+        if not 0.5 <= self.fps <= 30:
+            raise ValueError(f"recording.fps must be in [0.5, 30], got {self.fps}")
+        if not 64 <= self.image_width <= 4096:
+            raise ValueError(f"recording.image_width must be in [64, 4096], got {self.image_width}")
+        if not 10 <= self.jpeg_quality <= 100:
+            raise ValueError(f"recording.jpeg_quality must be in [10, 100], got {self.jpeg_quality}")
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> RecordingConfig:
+        d = dict(d or {})
+        unknown = set(d) - {"enabled", "fps", "image_width", "jpeg_quality"}
+        if unknown:
+            raise ValueError(f"unknown recording settings {sorted(unknown)}")
+        casts = {"enabled": bool, "fps": float, "image_width": int, "jpeg_quality": int}
+        return cls(**{k: casts[k](v) for k, v in d.items()})
+
+
 @dataclass
 class RobotConfig:
     port: str
@@ -40,6 +65,7 @@ class RobotConfig:
     joint_limits_deg: dict[str, tuple[float, float]] = field(default_factory=dict)
     poses: dict[str, np.ndarray] = field(default_factory=dict)
     workspace: dict[str, tuple[float, float]] = field(default_factory=dict)
+    recording: RecordingConfig = field(default_factory=RecordingConfig)
 
     def check_in_workspace(self, point_m: np.ndarray) -> None:
         """Raise ValueError if a base-frame point lies outside the configured workspace box."""
@@ -74,6 +100,7 @@ class RobotConfig:
             joint_limits_deg={k: tuple(v) for k, v in (raw["arm"].get("joint_limits_deg") or {}).items()},
             poses={k: np.asarray(v, dtype=float) for k, v in (raw.get("poses") or {}).items()},
             workspace={ax: (float(raw["workspace"][ax][0]), float(raw["workspace"][ax][1])) for ax in "xyz"},
+            recording=RecordingConfig.from_dict(raw.get("recording")),
         )
 
     def make_arm(self):

@@ -7,5 +7,3 @@ runs/
 data/
 *.mp4
 *.npz
-# Exception: the README demo video (documentation, not data).
-!docs/media/*.mp4

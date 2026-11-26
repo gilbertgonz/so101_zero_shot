@@ -30,8 +30,7 @@ class SimBus:
                 self.pos.update({m: int(v) for m, v in values.items()})
 
     def sync_read(self, register, motors=None, num_retry=2):
-        with self._lock:
-            return {m: self.pos[m] for m in (motors or MOTOR_IDS)}
+        return {m: self.read(register, m) for m in (motors or MOTOR_IDS)}
 
     def read(self, register, motor, num_retry=2):
         if register == "Present_Load":
