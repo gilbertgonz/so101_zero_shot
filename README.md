@@ -8,7 +8,7 @@ grasp picks it up. No demonstrations, no training. All models run locally.
 Instead of typing a prompt you can also click the object in the live camera view; the robot names what
 it found and where, and asks before grasping.
 
-[![Demo: a language-prompt grasp and a click grasp, robot UI and real robot side by side](docs/media/demo_poster.jpg)](docs/media/so101_zero_shot_demo.mp4)
+https://github.com/user-attachments/assets/5e1c48a6-4354-42b8-9a45-cb0b77081d4b
 
 ## Setup
 ```
