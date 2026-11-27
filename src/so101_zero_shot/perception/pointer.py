@@ -72,14 +72,28 @@ def parse_pointing(text: str, width: int, height: int) -> Pointing:
 
 
 class VlmPointer:
-    def __init__(self, model_id: str = "Qwen/Qwen3-VL-2B-Instruct", device: str | None = None, max_new_tokens: int = 96):
+    def __init__(self, model_id: str = "Qwen/Qwen3-VL-2B-Instruct", device: str | None = None, max_new_tokens: int = 96,
+                 quantization: str | None = None):
+        """quantization: None (bf16), "8bit" or "4bit" (bitsandbytes, CUDA only): the 4B model needs ~9 GB
+        in bf16 and ~3.5 GB in 4-bit."""
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         self.torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_id, self.quantization = model_id, quantization
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=torch.bfloat16).to(self.device).eval()
+        if quantization in (None, "", "none"):
+            self.model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=torch.bfloat16).to(self.device).eval()
+        elif quantization in ("4bit", "8bit"):
+            from transformers import BitsAndBytesConfig
+
+            q = (BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16)
+                 if quantization == "4bit" else BitsAndBytesConfig(load_in_8bit=True))
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_id, dtype=torch.bfloat16, quantization_config=q, device_map=self.device).eval()
+        else:
+            raise ValueError(f"quantization must be none, 8bit or 4bit, got {quantization!r}")
         self.max_new_tokens = max_new_tokens
 
     def point(self, image_rgb: np.ndarray, query: str) -> Pointing:
@@ -105,6 +119,23 @@ class VlmPointer:
             {"type": "image", "image": Image.fromarray(image_rgb)}, {"type": "text", "text": prompt}]}]
         inputs = self.processor.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
+        ).to(self.device)
+        with self.torch.inference_mode():
+            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        return self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+
+    def detect(self, image_rgb: np.ndarray, what: str | None = None, max_new_tokens: int = 512) -> list[Detection]:
+        """Every instance of `what` (default: every object on the table) with a box and a short label."""
+        h, w = image_rgb.shape[:2]
+        prompt = DETECT_PROMPT.format(what=what or DETECT_OBJECTS)
+        return parse_detections(self._ask(image_rgb, prompt, max_new_tokens), w, h)
+
+    def generate(self, messages: list[dict], max_new_tokens: int = 512, tools: list[dict] | None = None) -> str:
+        """Free chat with the same model (the agent's planner). `messages` use the transformers chat format;
+        images as {"type": "image", "image": PIL image}."""
+        kw = {"tools": tools} if tools else {}
+        inputs = self.processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt", **kw
         ).to(self.device)
         with self.torch.inference_mode():
             out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
@@ -146,3 +177,71 @@ def clean_name(text: str, max_words: int = 8) -> str:
     if words and words[0].lower() in ("a", "an", "the"):
         words = words[1:]
     return " ".join(words[:max_words]) or "unknown object"
+
+
+DETECT_PROMPT = (
+    "Detect {what} in the image. Answer with a JSON list only, no other text: "
+    '[{{"bbox_2d": [x1, y1, x2, y2], "label": "<color and name, 1 to 4 words>"}}, ...]. '
+    "One entry per separate item. Answer [] if there are none."
+)
+DETECT_OBJECTS = ("every separate object lying on the table (not the table, not the robot's own gripper "
+                  "fingers at the bottom of the image, not shadows)")
+DETECT_HANDS = "every human hand"
+
+
+@dataclass
+class Detection:
+    label: str
+    box_px: np.ndarray  # (4,) x1, y1, x2, y2 in image pixels
+    point_px: np.ndarray  # box centre
+
+    def as_pointing(self) -> Pointing:
+        return Pointing(self.point_px, self.box_px, self.label)
+
+
+def parse_detections(text: str, width: int, height: int, min_side_px: float = 6.0) -> list[Detection]:
+    """Parse a JSON list of {"bbox_2d", "label"} (0..1000 grid). Tolerates code fences, a single object
+    instead of a list, and junk entries (skipped). Near-duplicate boxes (IoU > 0.8) are merged."""
+    m = re.search(r"(\[.*\]|\{.*\})", text, re.S)
+    if m is None:
+        return []
+    try:
+        obj = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        # Long lists sometimes get cut off: keep the complete entries.
+        items = re.findall(r"\{[^{}]*\}", m.group(1))
+        obj = []
+        for it in items:
+            try:
+                obj.append(json.loads(it))
+            except json.JSONDecodeError:
+                continue
+    if isinstance(obj, dict):
+        obj = [obj]
+    if not isinstance(obj, list):
+        return []
+    scale = np.tile(np.array([width, height]) / COORD_SCALE, 2)
+    out: list[Detection] = []
+    for o in obj:
+        if not isinstance(o, dict):
+            continue
+        box = _vec(o.get("bbox_2d"), 4)
+        if box is None:
+            continue
+        box = np.clip(box * scale, 0, np.tile([width - 1, height - 1], 2))
+        box = np.array([min(box[0], box[2]), min(box[1], box[3]), max(box[0], box[2]), max(box[1], box[3])])
+        if min(box[2] - box[0], box[3] - box[1]) < min_side_px:
+            continue
+        label = clean_name(str(o.get("label") or "object"), max_words=6)
+        if any(box_iou(box, d.box_px) > 0.8 for d in out):
+            continue
+        out.append(Detection(label, box, np.array([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2])))
+    return out
+
+
+def box_iou(a: np.ndarray, b: np.ndarray) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return float(inter / union) if union > 0 else 0.0

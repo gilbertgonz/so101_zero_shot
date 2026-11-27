@@ -69,7 +69,7 @@ def test_ik_results_pass_the_arm_limit_check():
     from so101_zero_shot.grasping.topdown import GraspPlanningError, TopDownPlanner
     from so101_zero_shot.kinematics.collision import CollisionChecker
     from so101_zero_shot.perception.geometry import FisheyeCamera
-    from so101_zero_shot.ui.sim import make_sim_arm
+    from fake_hardware import make_sim_arm
 
     cfg = RobotConfig.load()
     kin = cfg.make_kinematics()

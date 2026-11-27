@@ -221,3 +221,64 @@ Findings
 Next
 - More grasps (different objects, positions, orientations) to measure the success rate.
 - VLM check of the after-lift image as a second opinion on "held".
+
+## 2026-11-26: Metric depth from stereo (replaces monocular + table fit)
+
+- Problem: monocular depth scaled on the table was 4-8 cm off in sim (tops of short objects far too high),
+  the reason the cube and marker grasps missed.
+- Compared the two "right way" options on simulated photo pairs with rendered ground truth
+  (`scripts/eval_depth.py`, 15 pairs, scan + close looks):
+  - two-view stereo: rectify the pair from the FK relative pose (cv2.stereoRectify), FoundationStereo
+    ViT-L (23-51-11), triangulate: 0.7-0.8 mm median depth error, 0.9 mm object top error, 3 s.
+    With FK pose error: 1 mm -> ~2 mm, 3 mm -> ~4-5 mm.
+  - MapAnything (apache model) with intrinsics + poses: ignores the metric scale of the poses (~8x too
+    deep); even with the true scale 1-5 mm. Not used.
+  - Tried and dropped: correcting disparity on the table plane (made pose-noise cases worse: 3.5 -> 8 mm),
+    SIFT essential-matrix refinement of the relative pose (no texture in sim, never triggers; kept, it only
+    applies when it agrees with FK within 3 deg), rectification alpha 0/0.5 (crops objects near the edge on
+    close looks: coverage 55-84%; alpha 1 kept).
+  - The 9 mm xy error on close looks is the scoring, not depth: the same measurement on true depth differs
+    by 0.7 mm (objects partly in view).
+- Wired in: `Skills.stereo_photo` takes the second photo (camera ~5 cm right, 3.5 / 2.5 cm if the base turn
+  would rotate the camera more than 15 deg) and returns to the first pose; Locator.locate / locate_at /
+  measure_many take `partner=` and use StereoDepth, else fall back to mono with a warning. Coarse look,
+  closer look, click mode and the agent's looks all use it. Estimates record `depth_source`.
+- Sim grasps with stereo: red cube, blue can, black marker held (cube and marker missed before). Measured
+  centres within ~0.5 cm and tops within 1 mm of the scene file. Green block measured right but out of
+  top-down reach at (30, -13) cm; yellow ball not found by the VLM from the scan pose (not depth).
+- Agent work (skills layer, scene memory, tool-calling agent) is paused until depth is validated on the arm.
+
+Next
+- Real arm: check stereo depth against measured object heights; FK / hand-eye accuracy decides the error.
+
+## 2026-11-26: Multi-view depth from the arm's own motion (replaces the sideways stereo move)
+
+- The sideways stereo move (2 extra moves, ~3 s, plus 4 s inference per look) was too slow and awkward
+  in operation. Instead: the views the arm gets anyway. Frames are kept during every move to a photo pose
+  (MotionFrames: frames every ~1 cm of camera travel, joints interpolated at the frame timestamp), and
+  each photo is measured with MVSAnywhere from the previous photo + 6 frames spread along the path.
+  plan_relook prefers closer-look poses >= 10 deg off the scan view's line of sight (head-on approaches
+  gave 1-5 deg of parallax at the object in earlier runs).
+- New eval set (eval_depth.py): 24 sim samples with scan photo, frames on the way, closer-look photo and
+  the sideways partner (baseline), all scored against rendered depth.
+  - MVSAnywhere previous photo + 6 frames: 3.3 mm median depth error, target top 4.2 mm median but 18 mm at
+    the 90th percentile (about 1 in 5 objects off by 1-2 cm in height), 0.66 s, 1.5 GB GPU.
+  - Baseline sideways stereo: 0.5 mm, top 0.6 / 4 mm, 4.2 s + extra motion. Mono: 38 mm.
+  - Frames: 2 -> 3.9 mm, 4 -> 3.5, 6 -> 3.3, 8 -> 3.5 (moves rarely give more than 8). Input size within
+    the camera's 960x720: 576x768 3.9 mm, 720x960 5.1 mm (worse; the model is trained near 640x480).
+  - MapAnything (scale from FK camera spread): its cameras come out metric but its depth is ~9x too far
+    at this range; ~2.5-2.9 s (ViT-g backbone). Dropped.
+  - FoundationStereo on natural pairs: ruled out; the natural motion is mostly forward (30-67 deg off
+    sideways) with 6-49 deg of camera turn, which rectification cannot handle.
+- Sim grasps with multi-view depth: red cube, blue can, black marker all held. Measured tops 4.0 / 5.4 /
+  1.2 cm vs true 3.0 / 7.0 / 1.8 cm: within the grasp's tolerance here, but this is the tail above.
+- Config: perception.look: frames, min_step_m, camera_latency_s.
+- Cleanup: every earlier depth method is removed from the code (Depth Anything + table fit, sideways
+  FoundationStereo, MapAnything); MVSAnywhere is the only one. A photo without other views is an error.
+  capture_scene saves the frames from its move (views/), so locate.py and grasp.py --dry-run still work;
+  the UI's --fake mode (one static image, no multi-view depth possible) is removed, --sim covers it.
+
+Next
+- Real arm: measure camera latency (frame timestamp vs exposure) and check heights against hand-measured
+  objects; motion blur at 30 deg/s.
+- The height tail (1-2 cm on ~20% of objects in sim) is the main remaining depth weakness.

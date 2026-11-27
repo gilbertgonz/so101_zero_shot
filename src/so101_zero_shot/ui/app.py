@@ -47,7 +47,7 @@ class UiState:
     joints_deg: list | None = None
     gripper_pct: float | None = None
     torque: bool = False
-    environment: str = "real"  # real | sim (MuJoCo) | fake (saved image)
+    environment: str = "real"  # real | sim (MuJoCo)
     recording: bool = True  # record an episode for the next run
     version: int = 0
 
@@ -100,6 +100,14 @@ class UiReporter:
         self.hub, self.stop_flag = hub, stop_flag
         self._lock = threading.Lock()
         self._pending: tuple | None = None
+
+    def add_step(self, step_id, label):
+        """Append a step (agent tool calls and their parts) unless it is already in the plan."""
+        def fn(s: UiState):
+            if not any(st["id"] == step_id for st in s.steps):
+                s.steps.append({"id": step_id, "label": label, "status": "pending", "message": "", "detail": {},
+                                "images": [], "t0": None, "t1": None})
+        self.hub.mutate(fn)
 
     def step(self, step_id, status, message="", detail=None, images=None):
         urls = [file_url(p) for p in images or [] if Path(p).exists()]
@@ -155,11 +163,17 @@ class UiReporter:
         pending[1].set()
         return True
 
+    CONFIRM_TEXT = {  # kind -> (title, approve label, decline label)
+        "grasp": ("Approve grasp?", "Approve grasp", "Cancel"),
+        "plan": ("Approve the agent's plan?", "Approve plan", "Cancel (return to rest)"),
+        "hand": ("Move toward a hand?", "Go ahead", "Don't"),
+    }
+
     def confirm(self, kind, prompt, images=None):
         if kind == "start":
             return True  # pressing Run is the consent to enable torque
-        value = self.choose(kind, "Approve grasp?", prompt,
-                            [("yes", "Approve grasp"), ("no", "Cancel (return to rest)")], images)
+        title, yes, no = self.CONFIRM_TEXT.get(kind, ("Approve?", "Approve", "Cancel"))
+        value = self.choose(kind, title, prompt, [("yes", yes), ("no", no)], images)
         return value == "yes"
 
     def choose(self, kind, title, prompt, options, images=None):
@@ -179,7 +193,7 @@ class UiReporter:
 class RunRequest(BaseModel):
     query: str = ""
     keep: bool = False
-    mode: str = "prompt"  # prompt | click
+    mode: str = "prompt"  # prompt | click | agent
 
 
 class ConfirmRequest(BaseModel):
@@ -212,11 +226,9 @@ ROBOT_VIEWS = {"3/4": (135.0, -25.0), "side": (90.0, -5.0), "top": (90.0, -89.0)
 class Backend:
     SIM_SHUFFLE_M = 0.03  # "shuffle" moves each object up to this far and turns it
 
-    def __init__(self, fake: bool = False, fake_image: Path | None = None, sim: bool = False):
-        if fake and sim:
-            raise ValueError("choose fake or sim, not both")
-        self.fake, self.fake_image, self.sim = fake, fake_image, sim
-        self.environment = "sim" if sim else "fake" if fake else "real"
+    def __init__(self, sim: bool = False):
+        self.sim = sim
+        self.environment = "sim" if sim else "real"
         self.hub = Hub()
         self.cfg = RobotConfig.load()
         self.hub.update(environment=self.environment, recording=self.cfg.recording.enabled)
@@ -224,6 +236,7 @@ class Backend:
         self.arm = None
         self.camera = None
         self.runner: GraspRunner | None = None
+        self.agent = None  # agent.Agent once the models are loaded
         self.rect = None
         self.stop_flag = threading.Event()
         self.reporter = UiReporter(self.hub, self.stop_flag)
@@ -272,26 +285,18 @@ class Backend:
             self._start_sim()
             return
         try:
-            if self.fake:
-                from .sim import SimCamera
-                self.camera = SimCamera(self.fake_image)
-            else:
-                cam = self.cfg.make_camera()
-                cam.connect()
-                cam.set_exposure(None)
-                self.camera = cam
-            self.hub.mutate(lambda s: s.status.update(camera="ok" + (" (sim)" if self.fake else "")))
+            cam = self.cfg.make_camera()
+            cam.connect()
+            cam.set_exposure(None)
+            self.camera = cam
+            self.hub.mutate(lambda s: s.status.update(camera="ok"))
         except Exception as e:  # noqa: BLE001
             self.hub.mutate(lambda s: s.status.update(camera=f"error: {e}"))
         try:
-            if self.fake:
-                from .sim import make_sim_arm
-                arm = make_sim_arm(self.cfg)
-            else:
-                arm = self.cfg.make_arm()
-                arm.connect(enable_torque=False)
+            arm = self.cfg.make_arm()
+            arm.connect(enable_torque=False)
             self.arm = arm
-            self.hub.mutate(lambda s: s.status.update(arm="ok" + (" (sim)" if self.fake else "")))
+            self.hub.mutate(lambda s: s.status.update(arm="ok"))
         except Exception as e:  # noqa: BLE001
             self.hub.mutate(lambda s: s.status.update(arm=f"error: {e}"))
 
@@ -327,6 +332,8 @@ class Backend:
             # Simulated runs (and their episodes) go to runs/sim/, away from the real-robot data.
             self.runner = GraspRunner(**parts, reporter=self.reporter, environment=self.environment,
                                       runs_dir=None if self.environment == "real" else RUNS_DIR / "sim")
+            from ..agent import Agent
+            self.agent = Agent(self.runner, parts["locator"].pointer)
             self.hub.mutate(lambda s: s.status.update(models="ok"))
         except Exception as e:  # noqa: BLE001
             logger.exception("model loading failed")
@@ -342,7 +349,7 @@ class Backend:
             try:
                 q = arm.read_joints()
                 g = arm.read_gripper()
-                torque = bool(arm.bus.read("Torque_Enable", "shoulder_pan")) if not self.fake else arm.bus.torque
+                torque = bool(arm.bus.read("Torque_Enable", "shoulder_pan"))
                 self.hub.update(joints_deg=[round(float(v), 1) for v in q], gripper_pct=round(g, 1), torque=torque)
                 last_err = ""
             except Exception as e:  # noqa: BLE001 - shown in the UI; keep polling
@@ -394,9 +401,9 @@ class Backend:
     # ---------------------------------------------------------------- actions
     def start_run(self, query: str, keep: bool, mode: str = "prompt") -> None:
         query = query.strip()
-        if mode not in ("prompt", "click"):
-            raise HTTPException(400, "mode must be prompt or click")
-        if mode == "prompt" and not query:
+        if mode not in ("prompt", "click", "agent"):
+            raise HTTPException(400, "mode must be prompt, click or agent")
+        if mode in ("prompt", "agent") and not query:
             raise HTTPException(400, "empty prompt")
         if self.hub.state.busy:
             raise HTTPException(409, "a run is already in progress")
@@ -404,16 +411,21 @@ class Backend:
             raise HTTPException(503, f"not ready: {self.hub.state.status}")
         record = bool(self.hub.state.recording)  # fixed for this run, whatever the toggle does meanwhile
         self.stop_flag.clear()
-        self.hub.reset_steps(STEPS if mode == "prompt" else STEPS_CLICK)
-        self.hub.update(busy=True, query=query if mode == "prompt" else "", mode=mode, result="", run_dir="",
+        from ..agent import agent_steps
+
+        self.hub.reset_steps({"prompt": STEPS, "click": STEPS_CLICK, "agent": agent_steps()}[mode])
+        self.hub.update(busy=True, query=query if mode != "click" else "", mode=mode, result="", run_dir="",
                         target_deg=None)
-        self.hub.log((f'run: "{query}"' if mode == "prompt" else "run: pick by clicking") + (" (keep)" if keep else "")
-                     + ("" if record else " (not recorded)"))
+        self.hub.log({"prompt": f'run: "{query}"', "click": "run: pick by clicking", "agent": f'agent: "{query}"'}[mode]
+                     + (" (keep)" if keep and mode != "agent" else "") + ("" if record else " (not recorded)"))
 
         def work():
             try:
-                res = self.runner.run(self.arm, self.camera, query if mode == "prompt" else None, keep=keep,
-                                      record=record)
+                if mode == "agent":
+                    res = self.agent.run(self.arm, self.camera, query, record=record)
+                else:
+                    res = self.runner.run(self.arm, self.camera, query if mode == "prompt" else None, keep=keep,
+                                          record=record)
                 self.hub.update(result=res.result, run_dir=res.out_dir.name)
             except Exception as e:  # noqa: BLE001 - surface in the UI
                 logger.exception("run crashed")
@@ -502,10 +514,10 @@ class Backend:
             yield f"data: {json.dumps(snap, default=str)}\n\n"
 
 
-def create_app(fake: bool = False, fake_image: Path | None = None, sim: bool = False) -> FastAPI:
+def create_app(sim: bool = False) -> FastAPI:
     from contextlib import asynccontextmanager
 
-    backend = Backend(fake=fake, fake_image=fake_image, sim=sim)
+    backend = Backend(sim=sim)
 
     @asynccontextmanager
     async def lifespan(_app):

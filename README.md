@@ -3,8 +3,8 @@
 ## Summary
 
 Zero-shot, language-conditioned grasping on an SO-101 arm with a single wrist-mounted fisheye camera:
-VLM points at the object from a prompt, SAM masks it, monocular depth lifts it to 3D, and a top-down IK
-grasp picks it up. No demonstrations, no training. All models run locally.
+VLM points at the object from a prompt, SAM masks it, multi-view depth from the photos and video frames
+the arm collects on its way lifts it to 3D, and a top-down IK grasp picks it up. No demonstrations, no training. All models run locally.
 Instead of typing a prompt you can also click the object in the live camera view; the robot names what
 it found and where, and asks before grasping.
 
@@ -14,17 +14,49 @@ https://github.com/user-attachments/assets/5e1c48a6-4354-42b8-9a45-cb0b77081d4b
 ```
 python3 -m venv .venv
 .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-.venv/bin/pip install -e '.[sim,dev,perception,ui]'
+.venv/bin/pip install -e '.[sim,dev,perception,quant,multiview,ui]'
 .venv/bin/pytest
 ```
+
+### Depth
+Metric depth comes from views the arm gets anyway, with no extra motion. While the arm moves to a photo
+pose (rest -> scan, scan -> closer look), a background thread keeps a video frame every ~1 cm of camera
+travel, tagged with the joint angles at its exposure time (`skills/motion_frames.py`). Each photo is then
+measured with [MVSAnywhere](https://github.com/nianticlabs/mvsanywhere) (zero-shot multi-view stereo,
+202M parameters, non-commercial license) from the photo, the previous photo and 6 of those frames spread
+along the path; camera poses come from forward kinematics. The closer-look pose is chosen at least 10 deg
+off the scan view's line of sight so the views differ enough. Setup (outside this repo):
+```
+git clone https://github.com/nianticlabs/mvsanywhere ~/data/third_party/mvsanywhere
+.venv/bin/pip install -e ~/data/third_party/mvsanywhere --no-deps
+curl -L -o ~/data/third_party/mvsanywhere/weights/mvsanywhere_hero.ckpt \
+  https://storage.googleapis.com/niantic-lon-static/research/mvsanywhere/mvsanywhere_hero.ckpt
+```
+`MVSANYWHERE_DIR` overrides the location. A photo with no other views (no move to it, no earlier
+photo) cannot be measured and fails with a clear error. Saved scenes (`scripts/capture_scene.py`) keep the
+frames from their move in `views/`, so `scripts/locate.py` and `grasp.py --dry-run` measure the same way.
+
+`scripts/eval_depth.py` measures it on simulated runs (photos and frames on the way) against rendered
+ground truth: `capture`, `run METHOD`, `report`. 24 samples (4 scan, 20 closer looks), closer looks:
+
+| other views | median depth error | target top error: median / 90% | time | GPU memory |
+|---|---|---|---|---|
+| previous photo + 2 frames | 3.9 mm | 5.0 mm / - | 0.53 s | 1.2 GB |
+| previous photo + 4 frames | 3.5 mm | 4.2 / 18 mm | 0.60 s | 1.4 GB |
+| **previous photo + 6 frames (default)** | **3.3 mm** | **4.2 / 18 mm** | **0.66 s** | **1.5 GB** |
+| previous photo + 8 frames | 3.5 mm | 4.5 mm / - | 0.79 s | 1.7 GB |
+
+More frames did not help (a move rarely gives more than 8 frames 1 cm apart); larger model inputs within
+the 960x720 rectified camera image (576x768: 3.9 mm, 720x960: 5.1 mm) were worse and slower. About 1 in 5
+objects gets its height wrong by 1-2 cm (the 90% column). On the real arm the frames are taken while
+moving, so `perception.look.camera_latency_s` (exposure to timestamp delay) needs measuring.
 
 ## Use
 - `scripts/ui.py`: web UI at http://127.0.0.1:8000: live wrist camera, live arm view (cyan ghost = pose it
   is moving to), prompt, step-by-step plan with images, approve/cancel, Stop, E-STOP.
-  `--fake` runs it against a simulated arm and a saved scene image.
   **Pick by clicking**: click an object in the camera view (either view); the robot masks and
   measures it, names it, and shows what it found and where before asking to grasp it.
-- `scripts/grasp.py "object"`: the same grasp from the terminal (`--dry-run SCENE` plans from a saved image).
+- `scripts/grasp.py "object"`: the same grasp from the terminal (`--dry-run SCENE` plans from a saved scene).
 
 ### Simulation (no arm needed)
 `scripts/ui.py --sim` (or `scripts/grasp.py --sim "red cube"`) runs the whole stack on a MuJoCo arm on a

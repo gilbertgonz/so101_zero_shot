@@ -1,4 +1,4 @@
-"""Find objects in a captured scene: VLM point -> SAM mask -> table-scaled depth -> 3D in the base frame.
+"""Find objects in a captured scene: VLM point -> SAM mask -> multi-view depth -> 3D in the base frame.
 
 Usage: locate.py SCENE QUERY [QUERY ...]
   SCENE: runs/scene_* dir name (or absolute path), or "latest"
@@ -19,15 +19,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import yaml
 
-from so101_zero_shot.config import CONFIG_DIR, RUNS_DIR, RobotConfig
-from so101_zero_shot.perception.depth import DepthAnything
-from so101_zero_shot.perception.geometry import FisheyeCamera, Rectifier
-from so101_zero_shot.perception.gripper_mask import GripperMask
-from so101_zero_shot.perception.locate import Locator, PerceptionError, draw_debug
-from so101_zero_shot.perception.pointer import VlmPointer
-from so101_zero_shot.perception.segment import Segmenter
+from so101_zero_shot.config import RUNS_DIR, RobotConfig
+from so101_zero_shot.grasping.setup import build_locator, make_rectifier
+from so101_zero_shot.perception.geometry import FisheyeCamera
+from so101_zero_shot.perception.locate import PerceptionError, draw_debug
+from so101_zero_shot.scenes import SceneError, load_scene
 
 
 def scene_dir(arg: str) -> Path:
@@ -54,24 +51,16 @@ def main() -> int:
     args = ap.parse_args()
 
     d = scene_dir(args.scene)
-    meta = json.loads((d / "scene.json").read_text())
-    img = cv2.imread(str(d / "image.jpg"))
-    if img is None:
-        raise SystemExit(f"cannot read {d / 'image.jpg'}")
+    try:
+        img, joints, views, _ = load_scene(d)
+    except SceneError as e:
+        raise SystemExit(str(e)) from e
     cfg = RobotConfig.load()
-    pcfg = yaml.safe_load((CONFIG_DIR / "robot.yaml").read_text()).get("perception") or {}
     cam = FisheyeCamera.load()
-    rect = Rectifier(cam, tuple(pcfg.get("rectified_size", (960, 720))), float(pcfg.get("rectified_hfov_deg", 100.0)))
+    rect = make_rectifier(cam)
 
     t0 = time.monotonic()
-    loc = Locator(
-        cam, cfg.make_kinematics(),
-        VlmPointer(pcfg.get("vlm_model", "Qwen/Qwen3-VL-2B-Instruct")),
-        Segmenter(pcfg.get("sam_model", "facebook/sam2.1-hiera-small")),
-        DepthAnything(pcfg.get("depth_model", "depth-anything/Depth-Anything-V2-Small-hf")),
-        rectifier=rect, table_z_m=float(pcfg.get("table_z_m", 0.0)),
-        gripper_mask=GripperMask.load(rect.K, rect.size, cfg.gripper_open_gap_m),
-    )
+    loc = build_locator(cfg, cfg.make_kinematics(), cam, rect)
     print(f"models loaded in {time.monotonic() - t0:.0f} s")
     cv2.imwrite(str(d / "rectified.jpg"), rect.rectify(img))
 
@@ -79,7 +68,7 @@ def main() -> int:
     for q in args.queries:
         t0 = time.monotonic()
         try:
-            est, debug = loc.locate(img, np.asarray(meta["joints_deg"]), q)
+            est, debug = loc.locate(img, joints, q, views=views)
         except PerceptionError as e:
             print(f'"{q}": NOT LOCATED: {e}')
             failures += 1
@@ -97,7 +86,7 @@ def main() -> int:
         except ValueError as e:
             ws = str(e)
         print(f'"{q}": centre ({c[0]:.1f}, {c[1]:.1f}) cm, top {est.top_z_m * 100:.1f} cm, '
-              f"table fit rmse {est.fit.rmse_m * 1000:.1f} mm, {dt:.1f} s; {ws}"
+              f"depth from {est.n_views} views, {dt:.1f} s; {ws}"
               + "".join(f"\n   warning: {w}" for w in est.warnings))
         print(f"   {d / f'locate_{name}.png'}")
     return 1 if failures else 0

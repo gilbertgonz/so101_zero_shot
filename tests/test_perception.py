@@ -6,14 +6,23 @@ import numpy as np
 import pytest
 
 from so101_zero_shot.config import RobotConfig
-from so101_zero_shot.perception.depth import DepthFitError, fit_table_scale
-from so101_zero_shot.perception.geometry import FisheyeCamera, Rectifier, table_depth, to_base
+from so101_zero_shot.perception.geometry import FisheyeCamera, Rectifier, to_base
 from so101_zero_shot.perception.gripper_mask import GRIPPER_VIEW_PATH, GripperMask, load_gripper_view
 from so101_zero_shot.perception.locate import Locator, PerceptionError
 from so101_zero_shot.perception.pointer import Pointing, parse_pointing
 
 BOX_XY = ((0.24, 0.28), (-0.03, 0.01))
 BOX_H = 0.05
+
+
+def table_depth(rays_cam, T_base_cam, table_z_m=0.0):
+    """Optical-axis depth at which each (x, y, 1) ray meets the plane z = table_z_m (NaN: misses)."""
+    R, o = T_base_cam[:3, :3], T_base_cam[:3, 3]
+    dz = rays_cam @ R[2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Z = (table_z_m - o[2]) / dz
+    Z[~(dz < -1e-6) | ~(Z > 0)] = np.nan
+    return Z
 
 
 @pytest.fixture(scope="module")
@@ -35,12 +44,20 @@ def scene():
 
 
 class FakeDepth:
-    def __init__(self, Z, a=3.0, b=0.7, noise=0.0):
-        rng = np.random.default_rng(0)
-        self.disp = (1.0 / Z - b) / a + rng.normal(0, noise, Z.shape)  # affine-invariant inverse depth
+    """Multi-view depth stand-in: the true depth plus noise (metres); records how many views it got."""
 
-    def disparity(self, rgb):
-        return self.disp
+    def __init__(self, Z, noise_m=0.0):
+        self.Z = Z + np.random.default_rng(0).normal(0, noise_m, Z.shape)
+        self.n_views = None
+
+    def depth(self, ref, others):
+        self.n_views = len(others)
+        return self.Z.copy(), {}
+
+
+def views(cam, q):
+    """One other view (contents irrelevant to FakeDepth), at the same joints."""
+    return [(np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8), q)]
 
 
 class FakePointer:
@@ -70,30 +87,24 @@ def test_scan_pose_sees_whole_workspace(scene):
             assert p[2] > 0 and 0 <= u < rect.size[0] and 0 <= v < rect.size[1], (x, y)
 
 
-def test_table_fit_recovers_affine():
-    rng = np.random.default_rng(1)
-    Z = rng.uniform(0.2, 0.5, (100, 100))
-    d = (1 / Z - 0.5) / 2.0
-    clutter = np.zeros_like(Z, bool)
-    clutter[:20] = True
-    d[clutter] += 0.3  # objects/clutter in the "table" region must be rejected
-    fit = fit_table_scale(d, Z, np.ones_like(Z, bool))
-    assert fit.a == pytest.approx(2.0, rel=1e-3) and fit.b == pytest.approx(0.5, abs=1e-3)
-    assert fit.rmse_m < 1e-4
-    with pytest.raises(DepthFitError):
-        fit_table_scale(d, Z, np.zeros_like(Z, bool))
-
-
-@pytest.mark.parametrize("noise", [0.0, 0.01])
-def test_locates_box(scene, noise):
+@pytest.mark.parametrize("noise_m", [0.0, 0.003])
+def test_locates_box(scene, noise_m):
     cfg, kin, cam, rect, q, Z, on_box = scene
-    loc = Locator(cam, kin, FakePointer(on_box), FakeSegmenter(on_box), FakeDepth(Z, noise=noise), rectifier=rect)
+    depth = FakeDepth(Z, noise_m)
+    loc = Locator(cam, kin, FakePointer(on_box), FakeSegmenter(on_box), depth, rectifier=rect)
     img = np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8)
-    est, _ = loc.locate(img, q, "box")
+    est, _ = loc.locate(img, q, "box", views=views(cam, q) * 2)
     (x0, x1), (y0, y1) = BOX_XY
     assert est.center_base[:2] == pytest.approx([(x0 + x1) / 2, (y0 + y1) / 2], abs=0.004)
-    assert est.top_z_m == pytest.approx(BOX_H, abs=0.004 + 0.1 * noise)
+    assert est.top_z_m == pytest.approx(BOX_H, abs=0.004 + noise_m)
+    assert depth.n_views == est.n_views == 2
 
+
+def test_no_other_views_is_an_error(scene):
+    cfg, kin, cam, rect, q, Z, on_box = scene
+    loc = Locator(cam, kin, FakePointer(on_box), FakeSegmenter(on_box), FakeDepth(Z), rectifier=rect)
+    with pytest.raises(PerceptionError, match="no other views"):
+        loc.locate(np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8), q, "box")
 
 
 def _gripper(mask):
@@ -105,7 +116,7 @@ def test_object_on_gripper_rejected(scene):
     loc = Locator(cam, kin, FakePointer(on_box), FakeSegmenter(on_box), FakeDepth(Z), rectifier=rect,
                   gripper_mask=_gripper(on_box.copy()))
     with pytest.raises(PerceptionError, match="own gripper"):
-        loc.locate(np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8), q, "box")
+        loc.locate(np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8), q, "box", views=views(cam, q))
 
 
 def test_object_touching_gripper_kept_minus_gripper_pixels(scene):
@@ -116,7 +127,7 @@ def test_object_touching_gripper_kept_minus_gripper_pixels(scene):
     g[v.max() - 3:] = True  # gripper covers the box's bottom few rows and everything below
     loc = Locator(cam, kin, FakePointer(on_box), FakeSegmenter(on_box), FakeDepth(Z), rectifier=rect,
                   gripper_mask=_gripper(g))
-    est, _ = loc.locate(np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8), q, "box")
+    est, _ = loc.locate(np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8), q, "box", views=views(cam, q))
     assert not (est.mask & g).any()
     assert any("gripper" in w for w in est.warnings)
     (x0, x1), (y0, y1) = BOX_XY
@@ -146,7 +157,7 @@ def test_not_found_raises(scene):
 
     loc = Locator(cam, kin, Blind(), FakeSegmenter(on_box), FakeDepth(Z), rectifier=rect)
     with pytest.raises(PerceptionError):
-        loc.locate(np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8), q, "unicorn")
+        loc.locate(np.zeros((cam.image_size[1], cam.image_size[0], 3), np.uint8), q, "unicorn", views=views(cam, q))
 
 
 def test_parse_pointing():

@@ -1,6 +1,6 @@
 """Zero-shot top-down grasp of a named object with the wrist camera (terminal version of scripts/ui.py).
 
-  1. rest -> scan: photo, coarse locate (VLM point + SAM mask + table-scaled depth)
+  1. rest -> scan: photo, coarse locate (VLM point + SAM mask + multi-view depth from the frames on the way)
   2. re-look: camera ~20 cm from the target, photo, locate again (more accurate; nothing hidden under
      the fingers)
   3. plan: fingertip point, wrist roll so the jaws close across the object's long axis; render the plan

@@ -7,6 +7,7 @@ calibration; the MuJoCo parallel gripper's clamp axis agrees with it).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -15,6 +16,8 @@ from ..calibration.viewpoints import gripper_radius, min_link_height, path_is_sa
 from ..kinematics import TIP_FRAME, SO101Kinematics
 from ..kinematics.collision import CollisionChecker
 from ..perception.geometry import FisheyeCamera
+
+logger = logging.getLogger(__name__)
 
 DOWN = np.array([0.0, 0.0, -1.0])
 # Bodies allowed to come close to the table during the final descent (the fingers must).
@@ -91,15 +94,24 @@ class TopDownPlanner:
     # ------------------------------------------------------------------ re-look
     def plan_relook(
         self, target_m: np.ndarray, from_deg: np.ndarray, distance_m: tuple[float, float] = (0.12, 0.22),
-        n_samples: int = 1500, seed: int = 0,
+        n_samples: int = 1500, seed: int = 0, min_parallax_deg: float = 10.0,
     ) -> np.ndarray:
         """Joints that put the camera 12-22 cm from the target, looking at it (near the image centre).
 
         The camera sits 8-10 cm up the wrist from the fingertips, so the fingertips go 4-14 cm above the
-        table, leaning outward (the optical axis is ~30 deg off the approach axis)."""
+        table, leaning outward (the optical axis is ~30 deg off the approach axis).
+
+        The photo from `from_deg` and the frames on the way are the other views for multi-view depth, so
+        poses that see the target at least `min_parallax_deg` away from the line of sight at `from_deg`
+        are preferred (flying straight at it gives no parallax at the target). If none is reachable the
+        best other pose is returned (depth then relies on the frames on the way, or falls back)."""
         rng = np.random.default_rng(seed)
         target_m = np.asarray(target_m, dtype=float)
-        best, best_score = None, np.inf
+        c0 = self.cam.pose_in_base(self.kin, np.asarray(from_deg, dtype=float))[:3, 3]
+        ray0 = (target_m - c0) / np.linalg.norm(target_m - c0)
+        # [poses with enough parallax, the rest]: (joints, score)
+        best: list = [None, None]
+        best_score = [np.inf, np.inf]
         for _ in range(n_samples):
             tip = target_m + np.array([rng.uniform(-0.10, 0.04), rng.uniform(-0.05, 0.05), rng.uniform(0.04, 0.14)])
             radial = np.append(tip[:2] - [0.0388, 0.0], 0.0)
@@ -117,16 +129,21 @@ class TopDownPlanner:
             if not distance_m[0] <= dist <= distance_m[1] or off_axis > 20.0:
                 continue
             score = off_axis + 0.2 * float(np.max(np.abs(q - from_deg))) / 10.0
-            if score >= best_score or not self._safe_pose(q):
+            parallax = float(np.degrees(np.arccos(np.clip(ray0 @ to_t / dist, -1, 1))))
+            tier = 0 if parallax >= min_parallax_deg else 1
+            if score >= best_score[tier] or not self._safe_pose(q):
                 continue
             if not path_is_safe(self.kin, self.cc, from_deg, q, self.clearance - 0.01):
                 continue
             if not path_is_safe(self.kin, self.cc, q, self.rest, self.clearance - 0.01):
                 continue
-            best, best_score = q, score
-        if best is None:
+            best[tier], best_score[tier] = q, score
+        if best[0] is not None:
+            return best[0]
+        if best[1] is None:
             raise GraspPlanningError(f"no safe re-look pose for target {np.round(target_m, 3)}")
-        return best
+        logger.warning("re-look pose sees the target less than %.0f deg off the first view", min_parallax_deg)
+        return best[1]
 
     # ------------------------------------------------------------------ grasp
     def plan_grasp(

@@ -79,6 +79,13 @@ class SimWorld:
         self._filter_collisions()
         self._objects = [m.body(i).name for i in range(m.nbody)
                          if m.body_jntnum[i] == 1 and m.jnt_type[m.body_jntadr[i]] == mujoco.mjtJoint.mjJNT_FREE]
+        self._hand_body = m.body("hand").id if "hand" in {m.body(i).name for i in range(m.nbody)} else None
+        self._hand_mocap = int(m.body_mocapid[self._hand_body]) if self._hand_body is not None else None
+        self._hand_park = m.body_pos[self._hand_body].copy() if self._hand_body is not None else None
+        self._robot_bodies = {i for i in range(1, m.nbody) if m.body_rootid[i] == m.body("base").id}
+        # Ground truth for tests and the benchmark, updated every physics step (see track()).
+        self.max_z: dict[str, float] = {}
+        self.hand_contact_n = 0.0  # largest arm-hand contact force since the last reset_tracking()
         self._home = self.data.qpos.copy()  # object layout from the XML
         self.torque = False
         self.reset()
@@ -174,7 +181,75 @@ class SimWorld:
             self.data.qpos[self._grip_qadr] = self.data.qpos[self._grip_left_qadr] = 0.0
             self.data.ctrl[self._aid[GRIPPER]] = 0.0
             self._set_torque(False)
+            if self._hand_mocap is not None:
+                self.data.mocap_pos[self._hand_mocap] = self._hand_park
+                self.data.mocap_quat[self._hand_mocap] = (1, 0, 0, 0)
             mujoco.mj_forward(self.model, self.data)
+            self.reset_tracking()
+
+    # ------------------------------------------------------------------ props and ground truth
+    HAND_POSES = {
+        # palm down, fingers pointing away from the robot (+x): a hand lying on / hovering over the table
+        "palm_down": np.eye(3),
+        # palm facing the robot, fingers up: offering a high five
+        "high_five": np.array([[0.0, 0.0, 1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0]]),
+    }
+
+    def set_hand(self, pos_m, pose: str = "palm_down", yaw_deg: float = 0.0) -> None:
+        """Put the hand prop at `pos_m` (palm centre, base frame) in a named pose, turned by yaw_deg about z."""
+        if self._hand_mocap is None:
+            raise RuntimeError("this scene has no hand prop")
+        if pose not in self.HAND_POSES:
+            raise ValueError(f"pose must be one of {list(self.HAND_POSES)}")
+        c, s_ = np.cos(np.radians(yaw_deg)), np.sin(np.radians(yaw_deg))
+        R = np.array([[c, -s_, 0], [s_, c, 0], [0, 0, 1.0]]) @ self.HAND_POSES[pose]
+        q = np.empty(4)
+        mujoco.mju_mat2Quat(q, R.reshape(-1))
+        with self._lock:
+            self.data.mocap_pos[self._hand_mocap] = np.asarray(pos_m, dtype=float)
+            self.data.mocap_quat[self._hand_mocap] = q
+            mujoco.mj_forward(self.model, self.data)
+
+    def hide_hand(self) -> None:
+        if self._hand_mocap is not None:
+            with self._lock:
+                self.data.mocap_pos[self._hand_mocap] = self._hand_park
+
+    def set_object(self, name: str, pos_m, yaw_deg: float = 0.0) -> None:
+        """Place a free object (resting pose: give z = its half height)."""
+        if name not in self._objects:
+            raise ValueError(f"no object {name!r}; objects: {self._objects}")
+        with self._lock:
+            adr = int(self.model.jnt_qposadr[self.model.body(name).jntadr[0]])
+            home = self._home[adr + 3:adr + 7].copy()
+            q = np.empty(4)
+            mujoco.mju_mulQuat(q, np.array([np.cos(np.radians(yaw_deg) / 2), 0, 0, np.sin(np.radians(yaw_deg) / 2)]), home)
+            self.data.qpos[adr:adr + 3] = pos_m
+            self.data.qpos[adr + 3:adr + 7] = q
+            dadr = int(self.model.jnt_dofadr[self.model.body(name).jntadr[0]])
+            self.data.qvel[dadr:dadr + 6] = 0.0
+            mujoco.mj_forward(self.model, self.data)
+
+    def reset_tracking(self) -> None:
+        with self._lock:
+            self.max_z = {n: float(self.data.body(n).xpos[2]) for n in self._objects}
+            self.hand_contact_n = 0.0
+
+    def _track(self) -> None:
+        """Highest point each object reached and the strongest arm-hand contact (called under the lock)."""
+        for n in self._objects:
+            z = float(self.data.body(n).xpos[2])
+            if z > self.max_z.get(n, -np.inf):
+                self.max_z[n] = z
+        if self._hand_body is None:
+            return
+        f6 = np.zeros(6)
+        for i in range(self.data.ncon):
+            con = self.data.contact[i]
+            b1, b2 = self.model.geom_bodyid[con.geom1], self.model.geom_bodyid[con.geom2]
+            if self._hand_body in (b1, b2) and ({b1, b2} & self._robot_bodies):
+                mujoco.mj_contactForce(self.model, self.data, i, f6)
+                self.hand_contact_n = max(self.hand_contact_n, float(abs(f6[0])))
 
     # ------------------------------------------------------------------ bus-facing (any thread)
     def _set_torque(self, on: bool) -> None:
@@ -220,6 +295,63 @@ class SimWorld:
         with self._lock:
             return {n: [round(float(v), 3) for v in self.data.body(n).xpos] for n in self._objects}
 
+    def render_truth(self, T_base_cam: np.ndarray, K: np.ndarray, size: tuple[int, int],
+                     near_m: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Exact view from a pinhole camera (OpenCV convention) at T_base_cam: (RGB, depth along the optical
+        axis in m). Ground truth for evaluating depth estimation; uses its own renderer in the calling
+        thread. Also sets self.last_robot_mask: pixels showing the robot itself."""
+        w, h = size
+        renderer = mujoco.Renderer(self.model, height=h, width=w)
+        try:
+            with self._lock:
+                renderer.update_scene(self.data, camera=mujoco.MjvCamera())
+            set_pinhole_camera(renderer.scene, T_base_cam, K, (w, h), near_m or self.near_clip_m)
+            rgb = renderer.render().copy()
+            renderer.enable_depth_rendering()
+            with self._lock:
+                renderer.update_scene(self.data, camera=mujoco.MjvCamera())
+            set_pinhole_camera(renderer.scene, T_base_cam, K, (w, h), near_m or self.near_clip_m)
+            depth = renderer.render().astype(np.float64)
+            renderer.disable_depth_rendering()
+            renderer.enable_segmentation_rendering()
+            with self._lock:
+                renderer.update_scene(self.data, camera=mujoco.MjvCamera())
+            set_pinhole_camera(renderer.scene, T_base_cam, K, (w, h), near_m or self.near_clip_m)
+            seg = renderer.render()
+        finally:
+            renderer.close()
+        geom = seg[..., 0]
+        objtype = seg[..., 1]
+        robot_geoms = np.array([self.model.geom_bodyid[g] in self._robot_bodies for g in range(self.model.ngeom)])
+        self.last_robot_mask = (objtype == int(mujoco.mjtObj.mjOBJ_GEOM)) & (geom >= 0) & \
+            robot_geoms[np.clip(geom, 0, self.model.ngeom - 1)]
+        # The renderer linearises the depth buffer with the model's near/far planes; the camera above uses
+        # its own near plane, so undo that and linearise again with it.
+        m = self.model
+        near_model, far = m.vis.map.znear * m.stat.extent, m.vis.map.zfar * m.stat.extent
+        near = near_m or self.near_clip_m
+        with np.errstate(divide="ignore", invalid="ignore"):
+            zbuf = (1.0 - near_model / depth) / (1.0 - near_model / far)
+            depth = near / (1.0 - zbuf * (1.0 - near / far))
+        depth[~np.isfinite(depth) | (depth <= 0) | (depth > 0.99 * far)] = np.nan
+        return rgb, depth
+
+    def object_geometry(self) -> dict[str, dict]:
+        """Each free object's centre and highest point (m) right now, from its geoms' bounding boxes."""
+        out = {}
+        with self._lock:
+            for n in self._objects:
+                b = self.model.body(n).id
+                tops = []
+                for g in range(self.model.ngeom):
+                    if self.model.geom_bodyid[g] != b:
+                        continue
+                    R = self.data.geom_xmat[g].reshape(3, 3)
+                    half = self.model.geom_aabb[g][3:]
+                    tops.append(float(self.data.geom_xpos[g][2] + np.abs(R[2]) @ half))
+                out[n] = {"center": self.data.body(n).xpos.copy(), "top_z": max(tops)}
+        return out
+
     # ------------------------------------------------------------------ camera (any thread)
     def read_frame(self, newer_than: float | None, timeout_s: float) -> tuple[np.ndarray, float]:
         deadline = time.monotonic() + timeout_s
@@ -260,6 +392,8 @@ class SimWorld:
                     while self.data.time < target and steps < 100:
                         mujoco.mj_step(self.model, self.data)
                         steps += 1
+                    if steps:
+                        self._track()
                     if self.data.time < target - 0.1:  # cannot keep up: run slower than real time
                         wall0, sim0 = now, self.data.time
                     draw = renderer is not None and now >= next_frame

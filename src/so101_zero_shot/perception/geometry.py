@@ -75,19 +75,6 @@ class Rectifier:
         return np.stack([(u - self.K[0, 2]) / self.K[0, 0], (v - self.K[1, 2]) / self.K[1, 1], np.ones_like(u)], axis=-1)
 
 
-def table_depth(rays_cam: np.ndarray, T_base_cam: np.ndarray, table_z_m: float = 0.0) -> np.ndarray:
-    """Optical-axis depth Z at which each (x, y, 1) ray meets the plane z = table_z in the base frame.
-
-    NaN where the ray does not hit the table in front of the camera.
-    """
-    R, o = T_base_cam[:3, :3], T_base_cam[:3, 3]
-    dz = rays_cam @ R[2]  # base-frame z component of each ray
-    with np.errstate(divide="ignore", invalid="ignore"):
-        Z = (table_z_m - o[2]) / dz
-    Z[~(dz < -1e-6) | ~(Z > 0)] = np.nan
-    return Z
-
-
 def to_base(rays_cam: np.ndarray, Z: np.ndarray, T_base_cam: np.ndarray) -> np.ndarray:
     """Camera rays (N, 3) at depths Z (N,) -> base-frame points (N, 3)."""
     P = rays_cam * Z[:, None]

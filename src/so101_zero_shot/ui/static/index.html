@@ -49,7 +49,10 @@
   .step .icon { width: 18px; text-align: center; font-weight: 700; }
   .step .label { flex: 1; }
   .step .time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-  .step .msg { color: var(--muted); font-size: 12px; margin: 2px 0 0 28px; }
+  .step .msg { color: var(--muted); font-size: 12px; margin: 2px 0 0 28px; white-space: pre-wrap; }
+  .step.sub { padding-left: 30px; font-size: 13px; }
+  .agentbtn { background: #1fa37a; color: white; }
+  .dialog p { white-space: pre-wrap; }
   .step.pending { color: var(--muted); } .step.active { border-left-color: var(--accent); background: #1a2233; }
   .step.done .icon { color: var(--ok); } .step.failed .icon, .step.failed .msg { color: var(--bad); }
   .step.stopped .icon, .step.stopped .msg { color: var(--warn); } .step.skipped { color: var(--muted); }
@@ -109,10 +112,11 @@
         <div class="clickmark" id="clickmark"></div>
       </div>
       <div class="controls">
-        <input id="prompt" type="text" placeholder='What should it pick up? e.g. "black dry erase marker"' autocomplete="off">
+        <input id="prompt" type="text" placeholder='Run: an object to pick up ("black marker"). Ask agent: any request ("put the red cube next to the blue can")' autocomplete="off">
         <label class="keep"><input type="checkbox" id="keep"> keep holding</label>
         <label class="keep" title="Save this run as an episode (camera frames + robot state + outcome)"><input type="checkbox" id="record"> record</label>
-        <button class="btn run" id="run">Run</button>
+        <button class="btn run" id="run" title="Find the named object and grasp it">Run</button>
+        <button class="btn agentbtn" id="agentbtn" title="Let the agent plan and carry out the request (it asks before moving)">Ask agent</button>
         <button class="btn pickbtn" id="pickbtn" title="Move to the scan pose, then click the object in the camera view">Pick by clicking</button>
         <button class="btn stop" id="stop" title="Hold, then return to rest. Press again while returning to cut torque where it is.">Stop</button>
         <button class="btn estop" id="estop" title="Disable torque immediately: the arm drops onto its stops.">E-STOP</button>
@@ -197,11 +201,13 @@ function render(s) {
   const ready = s.status.models === "ok" && String(s.status.arm).startsWith("ok") && String(s.status.camera).startsWith("ok");
   $("run").disabled = s.busy || !ready;
   $("pickbtn").disabled = s.busy || !ready;
+  $("agentbtn").disabled = s.busy || !ready;
   $("stop").disabled = !s.busy;
   $("prompt").disabled = s.busy;
   $("record").checked = !!s.recording;
   $("record").disabled = s.busy;
-  $("query").textContent = s.query ? `"${s.query}"` : (s.mode === "click" && (s.busy || s.result) ? "(picked by clicking)" : "");
+  $("query").textContent = s.query ? (s.mode === "agent" ? `agent: "${s.query}"` : `"${s.query}"`)
+    : (s.mode === "click" && (s.busy || s.result) ? "(picked by clicking)" : "");
   const wrap = document.querySelector(".imgwrap");
   wrap.classList.toggle("picking", !!s.pick);
   $("banner").textContent = s.pick ? s.pick.prompt : "";
@@ -209,7 +215,8 @@ function render(s) {
 
   const res = $("result");
   res.textContent = s.busy ? "running..." : (s.result ? `last result: ${s.result}` : "");
-  res.className = "result " + (s.result === "held" ? "held" : (s.result && s.result !== "held" ? "bad" : ""));
+  const good = s.result === "held" || String(s.result).startsWith("done");
+  res.className = "result " + (good ? "held" : (s.result ? "bad" : ""));
 
   const active = s.steps.find(x => x.status === "active");
   $("overlay-step").textContent = active ? active.label : (s.busy ? "working..." : "idle");
@@ -228,7 +235,7 @@ function render(s) {
         ${det.length ? `<table>${det.map(([k, v]) => `<tr><td>${esc(k.replace(/_/g, " "))}</td><td>${fmtVal(v)}</td></tr>`).join("")}</table>` : ""}
         ${st.images.length ? `<div class="thumbs">${st.images.map(u => `<img src="${u}" data-full="${u}">`).join("")}</div>` : ""}
       </div>` : "";
-    return `<div class="step ${st.status}" data-id="${st.id}">
+    return `<div class="step ${st.status}${String(st.id).includes(".") ? " sub" : ""}" data-id="${st.id}">
       <div class="row"><span class="icon">${icon}</span><span class="label">${esc(st.label)}</span><span class="time">${elapsed(st)}</span></div>
       ${st.message ? `<div class="msg">${esc(st.message)}</div>` : ""}${body}</div>`;
   }).join("");
@@ -272,6 +279,7 @@ $("confirm-actions").addEventListener("click", (e) => {
   if (b && confirmId) post("/api/confirm", { id: confirmId, answer: b.dataset.v });
 });
 $("pickbtn").addEventListener("click", () => post("/api/run", { mode: "click", keep: $("keep").checked }));
+$("agentbtn").addEventListener("click", () => post("/api/run", { mode: "agent", query: $("prompt").value }));
 let camView = "rect";
 $("cam").addEventListener("click", (e) => {
   if (!state || !state.pick) return;

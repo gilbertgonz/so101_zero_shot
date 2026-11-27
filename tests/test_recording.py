@@ -12,7 +12,8 @@ from so101_zero_shot.config import RecordingConfig, RobotConfig
 from so101_zero_shot.perception.geometry import FisheyeCamera
 from so101_zero_shot.recording import (EPISODE_COLUMNS, IMAGE_KEY, EpisodeRecorder, decode_image, effective_success,
                                        load_episode, outcome_of)
-from so101_zero_shot.ui.sim import SimCamera, make_sim_arm
+
+from fake_hardware import SimCamera, make_sim_arm
 
 
 @pytest.fixture

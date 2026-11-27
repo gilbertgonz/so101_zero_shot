@@ -81,10 +81,11 @@ def git_version() -> dict:
 
 
 def outcome_of(result: str, events: list[dict]) -> dict:
-    """Summarise a runner result string (held | missed | aborted: why | stopped | estopped | error: why)."""
+    """Summarise a run result string: held | missed | aborted: why | stopped | estopped | error: why (grasp
+    runs), done: message | failed: message | gave up: why | refused: why (agent runs)."""
     status, _, reason = result.partition(":")
     status = status.strip()
-    attempted = any(e.get("step") == "close" and e.get("status") == "active" for e in events)
+    attempted = any(str(e.get("step")).split(".")[-1] == "close" and e.get("status") == "active" for e in events)
     last = next((e for e in reversed(events) if e.get("kind") == "step"
                  and e.get("status") in ("failed", "stopped")), None)
     return {
@@ -92,7 +93,8 @@ def outcome_of(result: str, events: list[dict]) -> dict:
         "status": status,
         # Did the jaws close on the object? Only known when a grasp was actually tried (auto, from the
         # gripper's position/load; see grasping/feedback.py). Human labels go in "label".
-        "success": {"held": True, "missed": False}.get(status),
+        # Agent runs: done / failed / gave up (step or time budget) / refused (said it cannot).
+        "success": {"held": True, "missed": False, "done": True, "failed": False, "gave up": False}.get(status),
         "grasp_attempted": attempted,
         "failed_step": last["step"] if last else None,
         "reason": reason.strip() or None,

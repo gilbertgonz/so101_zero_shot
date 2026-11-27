@@ -10,12 +10,13 @@ from so101_zero_shot.grasping import runner as runner_mod
 from so101_zero_shot.grasping.runner import GraspRunner
 from so101_zero_shot.grasping.topdown import TopDownPlanner
 from so101_zero_shot.kinematics.collision import CollisionChecker
-from so101_zero_shot.perception.depth import TableFit
 from so101_zero_shot.perception.geometry import FisheyeCamera, Rectifier
 from so101_zero_shot.perception.locate import ObjectEstimate, PerceptionError
 from so101_zero_shot.perception.pointer import Pointing
 from so101_zero_shot.recording import load_episode
-from so101_zero_shot.ui.sim import SimCamera, make_sim_arm
+from so101_zero_shot.skills.motion_frames import LookSettings
+
+from fake_hardware import SimCamera, make_sim_arm
 
 
 class FakeLocator:
@@ -26,23 +27,25 @@ class FakeLocator:
         self.bad_clicks = bad_clicks  # first N clicks hit "the gripper"
         self.pointer = self
         self.clicks = 0
+        self.views = []  # joints of the other views each measurement got
 
     def describe(self, rgb, mask):
         return "black marker"
 
-    def locate_at(self, img, q, point_px, box_px=None, label="", gripper_pct=0.0):
+    def locate_at(self, img, q, point_px, box_px=None, label="", gripper_pct=0.0, views=None):
         self.clicks += 1
         if self.clicks <= self.bad_clicks:
             raise PerceptionError("that is the robot's own gripper")
-        return self.locate(img, q, label)
+        return self.locate(img, q, label, views=views)
 
-    def locate(self, img, q, query, gripper_pct=0.0):
+    def locate(self, img, q, query, gripper_pct=0.0, views=None):
+        self.views.append([np.asarray(v[1]) for v in views or []])
         y = np.linspace(-0.06, 0.06, 200)
         pts = np.c_[np.full(200, 0.25), y, np.full(200, 0.015)]
         h, w = self.rect.size[1], self.rect.size[0]
         est = ObjectEstimate(query, Pointing(np.array([w / 2, h / 2]), None, "{}"), np.zeros((h, w), bool), 0.9, pts,
-                             np.array([0.25, 0.0, 0.015]), 0.015, TableFit(1, 0, 1000, 0.9, 0.002),
-                             self.cam.pose_in_base(self.kin, q))
+                             np.array([0.25, 0.0, 0.015]), 0.015,
+                             self.cam.pose_in_base(self.kin, q), len(views or []))
         est.mask[h // 2 - 5:h // 2 + 5, w // 2 - 40:w // 2 + 40] = True
         img = np.zeros((h, w, 3), np.uint8)
         return est, {"rect_bgr": img, "depth_m": np.full((h, w), 0.3)}
@@ -94,6 +97,9 @@ def setup(parts, tmp_path, monkeypatch):
     cv2.imwrite(str(img), np.zeros((1200, 1600, 3), np.uint8))
     arm = make_sim_arm(parts["cfg"])
     arm.control_hz = 500.0  # fast simulated moves
+    # A fresh locator per test (it records what each measurement got; tests change its depth kind).
+    parts = {**parts, "locator": FakeLocator(parts["cam_model"], parts["kin"], parts["rect"]),
+             "look_settings": LookSettings(min_step_m=0.003)}  # fast moves: few frames at 1 cm spacing
     return parts, arm, SimCamera(img)
 
 
@@ -113,8 +119,21 @@ def test_full_grasp_holds_and_returns(setup):
     meta, table = load_episode(res.out_dir)
     assert meta["outcome"]["status"] == "held" and meta["outcome"]["success"] is True
     assert meta["outcome"]["grasp_attempted"] and meta["task"]["instruction"] == "pick up the marker"
-    assert table.num_rows == meta["num_frames"] > 0 and "home" in table["phase"].to_pylist()
+    # "home" lasts ~0.1 s in this fast fake run, so the 10 Hz samples may miss it; the step events never do.
+    assert table.num_rows == meta["num_frames"] > 0 and "coarse" in table["phase"].to_pylist()
+    assert any(e["kind"] == "step" and e.get("step") == "home" for e in meta["events"])
     assert any(e["kind"] == "confirm" and e["question"] == "grasp" for e in meta["events"])
+    # Multi-view depth without extra motion: the coarse look gets frames from the move rest -> scan, the
+    # closer look the coarse photo plus frames from scan -> closer look.
+    coarse, relook = parts["locator"].views
+    assert 1 <= len(coarse) <= LookSettings.frames
+    assert np.allclose(relook[0], res.log["coarse_joints_deg"]) and len(relook) >= 2
+    assert (res.out_dir / "relook_v0.jpg").exists()
+    scan_c = parts["cam_model"].pose_in_base(parts["kin"], parts["cfg"].poses["scan"])[:3, 3]
+    for q in relook[1:]:  # frames on the way, none at the closer-look pose itself
+        c = parts["cam_model"].pose_in_base(parts["kin"], q)[:3, 3]
+        ref = parts["cam_model"].pose_in_base(parts["kin"], np.asarray(res.log["relook_joints_deg"]))[:3, 3]
+        assert np.linalg.norm(c - ref) >= 0.015 and np.linalg.norm(c - scan_c) > 1e-4
 
 
 def test_run_without_recording(setup):

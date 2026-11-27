@@ -23,11 +23,17 @@
         <material name="green" rgba="0.15 0.65 0.25 1" />
         <material name="marker_body" rgba="0.08 0.08 0.08 1" />
         <material name="marker_band" rgba="0.92 0.92 0.92 1" />
+        <material name="skin" rgba="0.87 0.67 0.54 1" />
+        <material name="sleeve" rgba="0.25 0.32 0.45 1" />
     </asset>
 
     <default>
         <default class="object">
             <geom friction="1.5 0.02 0.002" condim="4" solref="0.004 1" />
+        </default>
+        <!-- Round things need rolling friction (condim 6) or one nudge sends them rolling off the table. -->
+        <default class="round">
+            <geom friction="1.5 0.02 0.01" condim="6" solref="0.004 1" />
         </default>
     </default>
 
@@ -46,16 +52,29 @@
         </body>
         <body name="yellow_ball" pos="0.18 -0.10 0.02">
             <freejoint />
-            <geom class="object" type="sphere" size="0.02" material="yellow" mass="0.03" />
+            <geom class="round" type="sphere" size="0.02" material="yellow" mass="0.03" />
         </body>
         <body name="marker" pos="0.29 0.02 0.009" euler="90 0 0">
             <freejoint />
-            <geom class="object" type="capsule" size="0.009 0.05" material="marker_body" mass="0.02" />
-            <geom class="object" type="cylinder" size="0.0095 0.012" pos="0 0 -0.02" material="marker_band" mass="0.002" />
+            <geom class="round" type="capsule" size="0.009 0.05" material="marker_body" mass="0.02" />
+            <geom class="round" type="cylinder" size="0.0095 0.012" pos="0 0 -0.02" material="marker_band" mass="0.002" />
         </body>
         <body name="green_block" pos="0.30 -0.13 0.02" euler="0 0 30">
             <freejoint />
             <geom class="object" type="box" size="0.012 0.03 0.02" material="green" mass="0.04" />
+        </body>
+
+        <!-- A person's right hand for hand-interaction tests (benchmark, SimWorld.set_hand). Kinematic
+             (mocap): it stays where it is put and the arm cannot push it. Body frame: fingers along +x,
+             palm facing -z, thumb toward +y. Parked out of view until placed. -->
+        <body name="hand" mocap="true" pos="-0.6 0.6 0.1">
+            <geom name="palm" type="box" size="0.040 0.042 0.013" material="skin" />
+            <geom type="capsule" fromto="0.040 0.030 0 0.088 0.032 0" size="0.0085" material="skin" />
+            <geom type="capsule" fromto="0.040 0.010 0 0.098 0.011 0" size="0.009" material="skin" />
+            <geom type="capsule" fromto="0.040 -0.010 0 0.094 -0.011 0" size="0.009" material="skin" />
+            <geom type="capsule" fromto="0.040 -0.030 0 0.080 -0.033 0" size="0.008" material="skin" />
+            <geom type="capsule" fromto="-0.010 0.042 -0.004 0.030 0.072 -0.006" size="0.0095" material="skin" />
+            <geom type="capsule" fromto="-0.040 0 0 -0.160 0 0" size="0.030" material="sleeve" contype="0" conaffinity="0" />
         </body>
     </worldbody>
 </mujoco>

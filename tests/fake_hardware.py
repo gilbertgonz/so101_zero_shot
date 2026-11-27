@@ -1,4 +1,4 @@
-"""Simulated hardware for `scripts/ui.py --fake`: exercise the whole UI and grasp flow without the arm.
+"""Fake hardware for tests: exercise the arm code and the grasp flow without the arm or MuJoCo.
 
 SimBus stands in for FeetechBus under the real SO101Arm, so interpolation, stopping and limits are the
 real code. Servos reach their goal immediately (one control tick); the gripper reports a squeeze load
@@ -14,8 +14,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from ..config import RobotConfig
-from ..hardware.so101 import GRIPPER, MOTOR_IDS, SO101Arm, joint_limits_from_calibration, load_calibration
+from so101_zero_shot.config import RobotConfig
+from so101_zero_shot.hardware.so101 import GRIPPER, MOTOR_IDS, SO101Arm, joint_limits_from_calibration, load_calibration
 
 
 class SimBus:
