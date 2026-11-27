@@ -13,6 +13,7 @@ server-sent events and video as MJPEG.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import threading
@@ -256,6 +257,9 @@ class ViewRequest(BaseModel):
     view: str
 
 
+# Links drawn as the arm's skeleton in the 3D map, base to fingertips.
+ARM_FRAMES = ("base_link", "shoulder_link", "upper_arm_link", "lower_arm_link", "wrist_link", "gripper_link",
+              "gripper_frame_link")
 ROBOT_VIEWS = {"3/4": (135.0, -25.0), "side": (90.0, -5.0), "top": (90.0, -89.0), "front": (180.0, -15.0)}
 
 
@@ -283,6 +287,8 @@ class Backend:
         # before running the app shutdown, so they must be stopped first (see close_streams / scripts/ui.py).
         self._streaming = True
         self._run_thread: threading.Thread | None = None
+        self._map_kin = None  # own kinematics for drawing the arm in the 3D map (the run's is busy with IK)
+        self._map_kin_lock = threading.Lock()
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -436,6 +442,53 @@ class Backend:
                     last_err = repr(e)
         r.close()  # in this thread: the EGL context belongs to it
 
+    # ---------------------------------------------------------------- 3D map
+    def scene_map_view(self, have: str = "") -> dict:
+        """What the robot has mapped (the latest run's SceneMap), for the UI's 3D map tab: surface points
+        (int16 mm, base frame) and colours (RGB), both base64, left out when the caller already `have`s this
+        version; plus the listed objects and the arm's skeleton, which are always sent (they are small)."""
+        out: dict = {"version": "", "views": 0, "objects": [], "arm": self._arm_skeleton()}
+        locator = self.runner.locator if self.runner is not None else None
+        smap = getattr(locator, "scene_map", None)
+        if smap is not None:
+            out["version"] = f"{id(smap):x}-{smap.views}"
+            out["views"] = smap.views
+            if out["version"] != have:
+                pts, cols = smap.points()
+                out["points"] = base64.b64encode(np.round(pts * 1000).astype("<i2").tobytes()).decode()
+                out["colors"] = base64.b64encode(cols.astype(np.uint8).tobytes()).decode()
+        scene = getattr(self.agent, "scene", None)
+        if scene is not None:
+            for _ in range(3):  # the run thread may add an object while this reads
+                try:
+                    objs = list(scene.objects.values())
+                    break
+                except RuntimeError:
+                    objs = []
+            for o in objs:
+                axis = o.axis_xy if o.axis_xy is not None else np.array([1.0, 0.0])
+                out["objects"].append({
+                    "name": o.name, "label": o.label, "kind": o.kind, "held": bool(o.held),
+                    "center_cm": [round(float(v) * 100, 1) for v in o.center_m[:3]],
+                    "top_cm": round(float(o.top_z_m) * 100, 1),
+                    "length_cm": round(float(o.length_m) * 100, 1), "width_cm": round(float(o.width_m) * 100, 1),
+                    "axis": [round(float(v), 3) for v in axis[:2]]})
+        return out
+
+    def _arm_skeleton(self) -> list:
+        q = self.hub.state.joints_deg
+        if not q:
+            return []
+        with self._map_kin_lock:
+            try:
+                if self._map_kin is None:
+                    self._map_kin = self.cfg.make_kinematics()
+                return [[round(float(v) * 100, 1) for v in self._map_kin.fk(np.asarray(q[:5], float), f)[:3, 3]]
+                        for f in ARM_FRAMES]
+            except Exception as e:  # noqa: BLE001 - the map still shows without the arm
+                logger.warning("3D map: arm skeleton failed: %r", e)
+                return []
+
     # ---------------------------------------------------------------- actions
     def start_run(self, query: str, keep: bool, mode: str = "prompt") -> None:
         query = query.strip()
@@ -578,6 +631,10 @@ def create_app(sim: bool = False) -> FastAPI:
     def events():
         return StreamingResponse(backend.events(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.get("/api/scene_map")
+    def scene_map(have: str = ""):
+        return backend.scene_map_view(have)
 
     @app.get("/stream/camera.mjpg")
     def camera(view: str = "rect"):

@@ -128,6 +128,7 @@ class Agent:
         (agent.reasoner.build_reasoner)."""
         self.runner, self.reasoner = runner, reasoner
         self.cfg = cfg or AgentConfig()
+        self.scene: Scene | None = None  # the latest run's scene list (the UI's 3D map labels it)
 
     @property
     def rep(self):
@@ -141,7 +142,7 @@ class Agent:
                      "agent": {"reasoner": self.reasoner.name, "calls": []}}
         s = Session(r.cfg, self.rep, out, log, r.environment, r.speed, r.cam_model)
         sk = r.skills(arm, camera, out, log)
-        scene = Scene(r.locator, r.cfg.check_in_workspace)
+        scene = self.scene = Scene(r.locator, r.cfg.check_in_workspace)
         tb = Toolbox(r, scene, s, sk, approve_hand=self.cfg.approve_hand, approve_grasp=self.cfg.approve_grasp)
         if not self.rep.confirm("start", f'Agent: "{request}"? It will look around, propose a plan and ask before '
                                          "moving toward anything."):

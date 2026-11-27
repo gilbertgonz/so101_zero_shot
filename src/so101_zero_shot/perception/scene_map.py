@@ -13,6 +13,7 @@ scene_map_height.png (top view).
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 import cv2
@@ -50,6 +51,7 @@ class SceneMap:
         ix, iy, iz = np.meshgrid(*(np.arange(s) for s in self.shape), indexing="ij")
         self.centers = (np.stack([ix, iy, iz], -1).reshape(-1, 3).astype(np.float32) + 0.5) * voxel_m + self.lo
         self.views = 0
+        self.lock = threading.RLock()  # the UI reads the map while a run fuses photos into it
 
     # ------------------------------------------------------------------ fusion
     def integrate(self, depth_m: np.ndarray, K: np.ndarray, T_base_cam: np.ndarray, rgb: np.ndarray | None = None,
@@ -57,6 +59,10 @@ class SceneMap:
         """Fuse one depth map (m along the optical axis, NaN = unknown) seen from `T_base_cam` with
         intrinsics K. `valid`: (H, W) bool, pixels to use (e.g. not the robot's own gripper). Returns the
         number of voxels updated."""
+        with self.lock:
+            return self._integrate(depth_m, K, T_base_cam, rgb, valid)
+
+    def _integrate(self, depth_m, K, T_base_cam, rgb, valid) -> int:
         h, w = depth_m.shape
         ok = np.isfinite(depth_m) & (depth_m > NEAR_M)
         if valid is not None:
@@ -106,13 +112,15 @@ class SceneMap:
 
     def points(self, min_weight: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
         """Surface points (N, 3) in the base frame (m) and their colours (N, 3) RGB uint8."""
-        sel = self._surface() & (self.weight >= min_weight)
-        return self.centers[sel].copy(), np.clip(self.color[sel], 0, 255).astype(np.uint8)
+        with self.lock:
+            sel = self._surface() & (self.weight >= min_weight)
+            return self.centers[sel].copy(), np.clip(self.color[sel], 0, 255).astype(np.uint8)
 
     def height_map(self) -> np.ndarray:
         """(nx, ny) top-surface height (m) per table cell (the highest occupied voxel); NaN where nothing
         was seen."""
-        surf = self._occupied().reshape(self.shape)
+        with self.lock:
+            surf = self._occupied().reshape(self.shape)
         z = self.lo[2] + (np.arange(self.shape[2]) + 0.5) * self.voxel
         top = np.where(surf, z[None, None, :], -np.inf).max(axis=2)
         return np.where(np.isfinite(top), top, np.nan).astype(np.float32)
