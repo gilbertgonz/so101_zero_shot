@@ -2,7 +2,7 @@
 sim's true object positions.
 
 The tasks need more than a direct instruction: choosing an object by what it is for, a motion no tool
-names (knocking something over, with move_gripper), placing between two objects, a multi-step task that
+names (knocking something over, with move_gripper), stacking one object on another, a multi-step task that
 needs a search first, and admitting an object is not there. Each run
 resets the sim scene (objects shifted up to 2 cm and turned, the same shifts for every reasoner), runs the
 agent with everything approved automatically, and scores the result:
@@ -52,6 +52,8 @@ LIFT_M = 0.03  # an object counts as picked up when it rose this far
 MOVED_M = 0.02  # ... and as moved when its centre shifted this far on the table
 ON_TABLE_M = 0.015  # set down = its centre ends within this of its starting height
 TIPPED_M = 0.01  # knocked over = its centre ended this much lower (the 7 cm cylinder lying: 1.9 cm lower)
+STACK_RISE_M = 0.02  # stacked = its centre ended at least this much higher (on the 3 cm cube: 3 cm higher) ...
+STACK_OFF_M = 0.02  # ... and within this of the base's centre (so standing on it, not leaning against it)
 
 
 # ------------------------------------------------------------------ scoring
@@ -101,21 +103,6 @@ def _score_pick(o: Outcome, target: str) -> Score:
     return "success", f"{target} lifted"
 
 
-def score_place(obj: str, goal: Callable[[Outcome], tuple[bool, str]]) -> Callable[[Outcome], Score]:
-    def score(o: Outcome) -> Score:
-        if not o.lifted(obj):
-            return "fail", f"{obj} not picked up"
-        if not o.on_table(obj):
-            return "partial", f"{obj} picked up but not set down on the table"
-        ok, why = goal(o)
-        other = o.disturbed({obj})
-        if not ok:
-            return "partial", f"{obj} placed, but {why}"
-        if other or o.status != "done":
-            return "partial", f"{why}; " + (f"also disturbed {', '.join(other)}" if other else f"ended {o.status!r}")
-        return "success", why
-    return score
-
 
 def next_to(obj: str, ref: str, max_gap_m: float = 0.09) -> Callable[[Outcome], tuple[bool, str]]:
     def goal(o: Outcome) -> tuple[bool, str]:
@@ -123,17 +110,6 @@ def next_to(obj: str, ref: str, max_gap_m: float = 0.09) -> Callable[[Outcome], 
         return d <= max_gap_m, f"{d * 100:.1f} cm from {ref} (want <= {max_gap_m * 100:.0f})"
     return goal
 
-
-def between(obj: str, a: str, b: str, max_off_m: float = 0.03) -> Callable[[Outcome], tuple[bool, str]]:
-    """obj ends on the segment from a to b: within max_off_m of it, and in its middle 60%."""
-    def goal(o: Outcome) -> tuple[bool, str]:
-        pa, pb, p = o.end[a][:2], o.end[b][:2], o.end[obj][:2]
-        ab = pb - pa
-        t = float(np.dot(p - pa, ab) / max(np.dot(ab, ab), 1e-9))
-        off = float(np.linalg.norm(p - (pa + np.clip(t, 0, 1) * ab)))
-        ok = 0.2 <= t <= 0.8 and off <= max_off_m
-        return ok, f"{off * 100:.1f} cm off the line from {a} to {b}, {100 * t:.0f}% of the way (want 20-80%)"
-    return goal
 
 
 def score_place_all(objs: list[str], goal: Callable[[Outcome, str], tuple[bool, str]]) -> Callable[[Outcome], Score]:
@@ -177,6 +153,24 @@ def score_knocked_over(obj: str) -> Callable[[Outcome], Score]:
     return score
 
 
+def score_stacked(obj: str, base: str) -> Callable[[Outcome], Score]:
+    """obj ends resting on top of base: higher than it started and centred over it, the base not pushed."""
+    def score(o: Outcome) -> Score:
+        if not o.lifted(obj):
+            return "fail", f"{obj} not picked up"
+        rise = float(o.end[obj][2] - o.start[obj][2])
+        off = float(np.linalg.norm(o.end[obj][:2] - o.end[base][:2]))
+        where = f"{rise * 100:+.1f} cm higher than at the start, {off * 100:.1f} cm off {base}'s centre"
+        if rise < STACK_RISE_M or off > STACK_OFF_M:
+            return "partial", f"{obj} picked up but not on {base} ({where})"
+        other = o.disturbed({obj})
+        if other or o.status != "done":
+            return "partial", f"{obj} on {base}; " + (f"also disturbed {', '.join(other)}" if other
+                                                      else f"ended {o.status!r}")
+        return "success", f"{obj} on {base} ({where})"
+    return score
+
+
 def score_refusal(o: Outcome) -> Score:
     moved = o.disturbed(set())
     if o.status not in ("refused", "failed"):
@@ -208,8 +202,8 @@ TASKS = [
     Task("write", "pick up something I can write with", "choosing an object by what it is for", score_pick("marker")),
     Task("knock", "knock over the blue cylinder", "a motion no tool names (the gripper has to push it over)",
          score_knocked_over("blue_cylinder")),
-    Task("between", "put the yellow ball between the red cube and the blue cylinder", "placing relative to two objects",
-         score_place("yellow_ball", between("yellow_ball", "red_cube", "blue_cylinder"))),
+    Task("stack", "place the blue cylinder on top of the red cube", "stacking: setting an object down on another",
+         score_stacked("blue_cylinder", "red_cube")),
     Task("tidy", "put the marker and the red cube next to the blue cylinder", "multi-step after a search (the marker "
          "starts far off to the left)",
          score_place_all(["marker", "red_cube"], lambda o, obj: next_to(obj, "blue_cylinder", NEXT_TO_M[obj])(o)),
