@@ -75,9 +75,15 @@ class LiveRenderer:
         self._pose(joints_deg, gripper_pct)
         return cv2.cvtColor(self.renderer.render(), cv2.COLOR_RGB2BGR)
 
-    def render_qpos(self, qpos: np.ndarray) -> np.ndarray:
-        """BGR image of a full simulation state (same scene file as the simulation: arm and objects)."""
+    def render_qpos(self, qpos: np.ndarray, mocap_pos: np.ndarray | None = None,
+                    mocap_quat: np.ndarray | None = None) -> np.ndarray:
+        """BGR image of a full simulation state (same scene file as the simulation: arm, objects and, given
+        mocap_pos / mocap_quat, props like the hand)."""
         self.data.qpos[:] = qpos
+        if mocap_pos is not None:
+            self.data.mocap_pos[:] = mocap_pos
+        if mocap_quat is not None:
+            self.data.mocap_quat[:] = mocap_quat
         mujoco.mj_forward(self.model, self.data)
         self.renderer.update_scene(self.data, camera=self.cam)
         return cv2.cvtColor(self.renderer.render(), cv2.COLOR_RGB2BGR)

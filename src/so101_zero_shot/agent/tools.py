@@ -16,16 +16,23 @@ import cv2
 import numpy as np
 
 from ..grasping.runner import STEPS_CLICK, GraspRunner
+from ..hardware.so101 import ARM_JOINTS
+from ..perception.locate import PerceptionError
 from ..perception.scene import Scene, SceneObject
 from ..skills import Session, SkillFailed, Skills, add_step
 
 logger = logging.getLogger(__name__)
 
-SUBSTEP_LABELS = {**dict(STEPS_CLICK), "look": "Take a photo and find objects"}
+SUBSTEP_LABELS = {**dict(STEPS_CLICK), "look": "Take a photo and find objects", "gesture": "Move the joints"}
 # Centre first (most accurate; it sets the numbers), then left and right (-pan turns toward +y = left).
 LOOK_AROUND = (("centre", 0.0), ("left", -30.0), ("right", 30.0))
 SIDES = {"left": (0.0, 1.0), "right": (0.0, -1.0), "front": (-1.0, 0.0), "behind": (1.0, 0.0)}
 PLACE_GAP_M = 0.03
+# move_joints (gestures): per-move and per-call caps, and how close the gripper may come to the table.
+GESTURE_MAX_DEG = 40.0
+GESTURE_MAX_MOVES = 8
+GESTURE_MIN_TIP_Z_M = 0.06
+GESTURE_START_Z_M = 0.10  # below this (e.g. at rest) a gesture starts from the raised scan pose
 
 
 def _fn(name: str, description: str, props: dict | None = None, required: list[str] | None = None) -> dict:
@@ -55,6 +62,14 @@ TOOL_SPECS = [
         "touch on a hand.", {"id": ID}, ["id"]),
     _fn("move_above", "Hover the gripper above an object or hand (e.g. to point at it).",
         {"id": ID, "height_cm": {"type": "number", "description": "above its top, default 8"}}, ["id"]),
+    _fn("move_joints", "Move the arm's own joints by relative angles, one move after another, for gestures and "
+        "body language. Joints: shoulder_pan (+ turns the arm right, - left), shoulder_lift (+ leans forward and "
+        "down), elbow_flex (+ bends down), wrist_flex (+ tilts the gripper down, - up), wrist_roll (twists the "
+        f"gripper). Each value is degrees added to that joint: at most {GESTURE_MAX_DEG:.0f} per move, at most "
+        f"{GESTURE_MAX_MOVES} moves. If the arm is low it first rises to a raised pose.",
+        {"moves": {"type": "array", "description": 'e.g. [{"wrist_flex": 20}, {"wrist_flex": -20}]',
+                   "items": {"type": "object", "properties": {j: {"type": "number"} for j in ARM_JOINTS}}}},
+        ["moves"]),
     _fn("go_home", "Move the arm back to its rest pose."),
     _fn("finish", "End the task: say whether it was done and give a short message for the person.",
         {"success": {"type": "boolean"}, "message": {"type": "string"}}, ["success", "message"]),
@@ -114,7 +129,7 @@ class Toolbox:
             return fn(**(args or {}))
         except TypeError as e:  # wrong / missing arguments
             return ToolResult(False, f"bad arguments for {name}: {e}")
-        except (KeyError, SkillFailed) as e:
+        except (KeyError, SkillFailed, PerceptionError) as e:
             return ToolResult(False, str(e).strip('"'))
         finally:
             self.s.rep = rep
@@ -256,11 +271,23 @@ class Toolbox:
                                  "are in the way)")
 
     def _spot_is_free(self, xy: np.ndarray, radius: float, exclude: set) -> bool:
+        """Clear of every remembered object (footprints) and, where the 3D map has seen it, of anything else
+        sticking up from the table (things the detector did not list). `exclude`: object ids to ignore (the
+        held one, the one to place next to)."""
+        ignore = []
         for other in self.scene.objects.values():
-            if other.name in exclude or other.held:
-                continue
             r = 0.5 * max(other.length_m, other.width_m, 0.02)
+            if other.name in exclude or other.held:
+                ignore.append((other.center_m[:2], r + 0.01))  # where it stands (or stood) in the map too
+                continue
             if np.linalg.norm(other.center_m[:2] - xy) < r + radius + 0.01:
+                return False
+        scene_map = self.sk.scene_map
+        if scene_map is not None and scene_map.views:
+            clear, top = scene_map.spot_clear(np.asarray(xy, float), radius + 0.005, ignore)
+            if clear is False:
+                logger.info("spot (%.0f, %.0f) cm: the 3D map has something %.1f cm tall there",
+                            xy[0] * 100, xy[1] * 100, top * 100)
                 return False
         return True
 
@@ -332,6 +359,49 @@ class Toolbox:
         used = self.sk.move_to(p, "auto")
         self.s.rep.step("move", "done", f"approach {used}")
         return ToolResult(True, f"Gripper is {float(height_cm):.0f} cm above {o.name}.")
+
+    def t_move_joints(self, moves) -> ToolResult:
+        if isinstance(moves, dict):
+            moves = [moves]
+        if not isinstance(moves, list) or not moves:
+            return ToolResult(False, "moves must be a list like [{\"wrist_flex\": 20}, {\"wrist_flex\": -20}]")
+        if len(moves) > GESTURE_MAX_MOVES:
+            return ToolResult(False, f"at most {GESTURE_MAX_MOVES} moves per call")
+        deltas = []
+        for i, m in enumerate(moves, 1):
+            if not isinstance(m, dict) or not m:
+                return ToolResult(False, f"move {i} must be an object like {{\"wrist_flex\": 20}}")
+            bad = sorted(set(m) - set(ARM_JOINTS))
+            if bad:
+                return ToolResult(False, f"move {i}: unknown joint(s) {bad}; joints: {', '.join(ARM_JOINTS)}")
+            try:
+                d = np.array([float(m.get(j, 0.0)) for j in ARM_JOINTS])
+            except (TypeError, ValueError):
+                return ToolResult(False, f"move {i}: values must be numbers of degrees")
+            if np.abs(d).max() > GESTURE_MAX_DEG:
+                return ToolResult(False, f"move {i}: at most {GESTURE_MAX_DEG:.0f} degrees per joint per move")
+            deltas.append(d)
+        self.s.begin("gesture")
+        q = self.sk.arm.read_joints()
+        if self.sk.kin.fk(q)[2, 3] < GESTURE_START_Z_M:
+            q = np.asarray(self.sk.scan, dtype=float)
+            self.sk.travel_to(q)
+        limits = getattr(self.sk.arm, "joint_limits", {}) or {}
+        targets = []
+        for i, d in enumerate(deltas, 1):  # check the whole gesture before moving
+            q = q + d
+            for j, v in zip(ARM_JOINTS, q):
+                lo, hi = limits.get(j, (-np.inf, np.inf))
+                if not lo <= v <= hi:
+                    raise SkillFailed(f"move {i} takes {j} to {v:.0f} deg, outside its range {lo:.0f}..{hi:.0f}")
+            if self.sk.kin.fk(q)[2, 3] < GESTURE_MIN_TIP_Z_M:
+                raise SkillFailed(f"move {i} would bring the gripper within {GESTURE_MIN_TIP_Z_M * 100:.0f} cm of "
+                                  "the table; use smaller or different moves")
+            targets.append(q)
+        for q in targets:
+            self.sk.move_joints(q)
+        self.s.rep.step("gesture", "done", f"{len(targets)} moves")
+        return ToolResult(True, f"Did {len(targets)} joint moves.")
 
     def t_go_home(self) -> ToolResult:
         self.s.begin("home", self.sk.rest)

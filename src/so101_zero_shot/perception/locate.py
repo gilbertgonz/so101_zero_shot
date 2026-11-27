@@ -96,6 +96,7 @@ class Locator:
         self.rays = self.rect.rays()
         self.table_z_m = table_z_m
         self.gripper_mask = gripper_mask
+        self.scene_map = None  # SceneMap: when set, every photo's depth is fused into it (Skills sets one per run)
         if gripper_mask is None:
             logger.warning("Locator without a gripper mask: masks on the robot's own fingers are not rejected")
 
@@ -157,13 +158,14 @@ class Locator:
         mask, score = self.segmenter.mask(rgb, pointing.point_px, pointing.box_px)
         warnings: list[str] = []
         mask = self._clean_mask(mask, query, pointing, gripper_pct, debug, warnings)
-        Z = self._depth(rgb, T, views, debug)
+        Z = self._depth(rgb, T, views, debug, gripper_pct)
         est = self._estimate(query, pointing, mask, score, Z, T, len(views or []), warnings)
         return est, debug
 
-    def _depth(self, rgb: np.ndarray, T: np.ndarray, views: OtherViews | None, debug: dict) -> np.ndarray:
+    def _depth(self, rgb: np.ndarray, T: np.ndarray, views: OtherViews | None, debug: dict,
+               gripper_pct: float = 0.0) -> np.ndarray:
         """Metric depth (m along the optical axis, NaN where unknown) on the rectified grid of this photo,
-        from the other views. Fills debug["depth_m"]."""
+        from the other views; also fused into scene_map if set. Fills debug["depth_m"]."""
         if not views:
             raise PerceptionError("no other views of the scene to measure depth from (photos need the frames "
                                   "from a move to them, or an earlier photo)")
@@ -174,7 +176,22 @@ class Locator:
         except ValueError as e:
             raise PerceptionError(f"depth failed: {e}") from e
         debug["depth_m"] = Z
+        if self.scene_map is not None:
+            self._fuse(Z, rgb, T, gripper_pct)
         return Z
+
+    def _fuse(self, Z: np.ndarray, rgb: np.ndarray, T: np.ndarray, gripper_pct: float) -> None:
+        """Add this photo's depth to the scene map, leaving out the robot's own gripper and the black border
+        of the rectified image."""
+        valid = rgb.max(axis=2) > 8
+        if self.gripper_mask is not None:
+            g = self.gripper_mask.mask(gripper_pct)
+            k = 4 * GRIPPER_GROW_PX + 1
+            valid &= cv2.dilate(g.astype(np.uint8), np.ones((k, k), np.uint8)) == 0
+        try:
+            self.scene_map.integrate(Z, self.rect.K, T, rgb, valid)
+        except Exception:  # noqa: BLE001 - the map is extra; measuring must not fail because of it
+            logger.exception("scene map update failed")
 
     def _clean_mask(self, mask: np.ndarray, query: str, pointing: Pointing, gripper_pct: float, debug: dict,
                     warnings: list[str]) -> np.ndarray:
@@ -236,7 +253,7 @@ class Locator:
                 cleaned.append((label, pointing, mask, score, warnings))
             except PerceptionError as e:
                 cleaned.append(e)
-        Z = self._depth(rgb, T, views, debug)
+        Z = self._depth(rgb, T, views, debug, gripper_pct)
         out: list[ObjectEstimate | PerceptionError] = []
         for c in cleaned:
             if isinstance(c, PerceptionError):

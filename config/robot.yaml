@@ -66,8 +66,9 @@ calibration_board:
 # Phase 2 perception (all local). Images are rectified from the fisheye to a pinhole view first; the
 # calibrated lens model is trustworthy to ~49 deg off-axis, so hfov 100 deg stays inside it.
 perception:
-  # One VLM points at objects, lists them, names them and plans the agent's steps. The 2B model points
-  # well but plans poorly; the 4B at 4-bit (~3.5 GB) labels objects with colours and plans usably.
+  # The VLM that points at objects, lists them and names them (the agent's planner is set under `agent:`;
+  # the same model with the same settings shares one loaded copy). The 2B model points well but plans
+  # poorly; the 4B at 4-bit (~3.5 GB) labels objects with colours and plans usably.
   # bf16 (vlm_quantization: none) needs ~9 GB of GPU memory.
   vlm_model: Qwen/Qwen3-VL-4B-Instruct
   vlm_quantization: 4bit   # none | 8bit | 4bit (bitsandbytes)
@@ -81,3 +82,9 @@ perception:
   rectified_size: [960, 720]
   rectified_hfov_deg: 100.0
   table_z_m: 0.0   # the base sits on the table
+
+# Free-form requests (scripts/agent.py, UI Agent mode).
+agent:
+  # Reasoning model: backend:model[@options] (see agent/reasoner.py). Same as perception.vlm_model and
+  # vlm_quantization here, so one copy is loaded.
+  reasoner: hf:Qwen/Qwen3-VL-4B-Instruct@4bit

@@ -217,6 +217,11 @@ class Session:
                     arm.bus.disable_torque(num_retry=5)
                 except Exception as e:  # noqa: BLE001 - report, the caller still disconnects
                     self.rep.log(f"failed to disable torque: {e!r}")
+                try:
+                    sk.save_map()
+                except Exception as e:  # noqa: BLE001 - the map is extra; the run log must still be saved
+                    logger.exception("saving the scene map failed")
+                    self.log["scene_map_error"] = repr(e)
                 self.save()
         finally:
             self.rep = rep

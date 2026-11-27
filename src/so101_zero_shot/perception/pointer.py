@@ -71,29 +71,41 @@ def parse_pointing(text: str, width: int, height: int) -> Pointing:
     return Pointing(pt, box, text)
 
 
+def load_hf_vlm(model_id: str, quantization: str | None = None, device: str | None = None):
+    """Load a transformers image-text chat model: returns (processor, model, device).
+
+    quantization: None / "none" (bf16), "8bit" or "4bit" (bitsandbytes, CUDA only): the 4B Qwen3-VL needs
+    ~9 GB in bf16 and ~3.5 GB in 4-bit."""
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    processor = AutoProcessor.from_pretrained(model_id)
+    if quantization in (None, "", "none"):
+        model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=torch.bfloat16).to(device).eval()
+    elif quantization in ("4bit", "8bit"):
+        from transformers import BitsAndBytesConfig
+
+        q = (BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16)
+             if quantization == "4bit" else BitsAndBytesConfig(load_in_8bit=True))
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_id, dtype=torch.bfloat16, quantization_config=q, device_map=device).eval()
+    else:
+        raise ValueError(f"quantization must be none, 8bit or 4bit, got {quantization!r}")
+    return processor, model, device
+
+
 class VlmPointer:
     def __init__(self, model_id: str = "Qwen/Qwen3-VL-2B-Instruct", device: str | None = None, max_new_tokens: int = 96,
                  quantization: str | None = None):
-        """quantization: None (bf16), "8bit" or "4bit" (bitsandbytes, CUDA only): the 4B model needs ~9 GB
-        in bf16 and ~3.5 GB in 4-bit."""
+        """quantization: see load_hf_vlm. The loaded model can be shared with the agent's reasoner
+        (agent.reasoner.HfReasoner.from_loaded)."""
         import torch
-        from transformers import AutoModelForImageTextToText, AutoProcessor
 
         self.torch = torch
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model_id, self.quantization = model_id, quantization
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        if quantization in (None, "", "none"):
-            self.model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=torch.bfloat16).to(self.device).eval()
-        elif quantization in ("4bit", "8bit"):
-            from transformers import BitsAndBytesConfig
-
-            q = (BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16)
-                 if quantization == "4bit" else BitsAndBytesConfig(load_in_8bit=True))
-            self.model = AutoModelForImageTextToText.from_pretrained(
-                model_id, dtype=torch.bfloat16, quantization_config=q, device_map=self.device).eval()
-        else:
-            raise ValueError(f"quantization must be none, 8bit or 4bit, got {quantization!r}")
+        self.model_id = model_id
+        self.quantization = None if quantization in (None, "", "none") else quantization
+        self.processor, self.model, self.device = load_hf_vlm(model_id, self.quantization, device)
         self.max_new_tokens = max_new_tokens
 
     def point(self, image_rgb: np.ndarray, query: str) -> Pointing:
@@ -129,17 +141,6 @@ class VlmPointer:
         h, w = image_rgb.shape[:2]
         prompt = DETECT_PROMPT.format(what=what or DETECT_OBJECTS)
         return parse_detections(self._ask(image_rgb, prompt, max_new_tokens), w, h)
-
-    def generate(self, messages: list[dict], max_new_tokens: int = 512, tools: list[dict] | None = None) -> str:
-        """Free chat with the same model (the agent's planner). `messages` use the transformers chat format;
-        images as {"type": "image", "image": PIL image}."""
-        kw = {"tools": tools} if tools else {}
-        inputs = self.processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt", **kw
-        ).to(self.device)
-        with self.torch.inference_mode():
-            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-        return self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
 
     def describe(self, image_rgb: np.ndarray, mask: np.ndarray) -> str:
         """Short name of the masked object (e.g. "black dry erase marker")."""

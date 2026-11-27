@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -195,6 +196,12 @@ class SimWorld:
         "high_five": np.array([[0.0, 0.0, 1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0]]),
     }
 
+    # Ready-made hand placements (palm centre m, pose, yaw deg) for scripts/agent.py and the benchmark.
+    HAND_PLACEMENTS = {
+        "five": ([0.34, 0.0, 0.10], "high_five", 0.0),  # held up in front of the robot for a high five
+        "down": ([0.24, 0.08, 0.035], "palm_down", 150.0),  # lying palm down on the table
+    }
+
     def set_hand(self, pos_m, pose: str = "palm_down", yaw_deg: float = 0.0) -> None:
         """Put the hand prop at `pos_m` (palm centre, base frame) in a named pose, turned by yaw_deg about z."""
         if self._hand_mocap is None:
@@ -291,6 +298,14 @@ class SimWorld:
         with self._lock:
             return self.data.qpos.copy()
 
+    def mocap_state(self, hide_parked: bool = True) -> tuple[np.ndarray, np.ndarray]:
+        """(mocap_pos, mocap_quat) of the props; a parked hand is moved under the floor (out of every view)."""
+        with self._lock:
+            pos, quat = self.data.mocap_pos.copy(), self.data.mocap_quat.copy()
+        if hide_parked and self._hand_mocap is not None and np.allclose(pos[self._hand_mocap], self._hand_park):
+            pos[self._hand_mocap] = [0.0, 0.0, -5.0]
+        return pos, quat
+
     def object_positions(self) -> dict[str, list[float]]:
         with self._lock:
             return {n: [round(float(v), 3) for v in self.data.body(n).xpos] for n in self._objects}
@@ -353,6 +368,11 @@ class SimWorld:
         return out
 
     # ------------------------------------------------------------------ camera (any thread)
+    def last_frame(self) -> np.ndarray | None:
+        """The newest wrist-camera frame (BGR), without waiting."""
+        with self._frame_cv:
+            return self._frame
+
     def read_frame(self, newer_than: float | None, timeout_s: float) -> tuple[np.ndarray, float]:
         deadline = time.monotonic() + timeout_s
         with self._frame_cv:
@@ -507,3 +527,103 @@ class SimWristCamera:
 
     def disconnect(self) -> None:
         pass
+
+
+class SimVideo:
+    """Record a run in the sim as an mp4: the whole scene from a 3/4 view with the wrist camera inset and
+    a caption, sped up `speedup` times (labelled). A context manager; frames are drawn in its own thread.
+
+        with SimVideo(world, "run.mp4", caption="pick up the red cube") as v:
+            ...  # run the robot
+            v.caption = "done"
+    """
+
+    # Camera: from the front left, a little above, framing the arm and the objects in front of it.
+    LOOKAT, DISTANCE, AZIMUTH, ELEVATION = (0.2, 0.0, 0.05), 0.6, 150.0, -35.0
+
+    def __init__(self, world: SimWorld, path, caption: str = "", fps: float = 10.0, speedup: float = 4.0,
+                 size: tuple[int, int] = (800, 600), hold_s: float = 2.0):
+        self.world, self.path, self.caption = world, Path(path), caption
+        self.fps, self.speedup, self.size, self.hold_s = fps, speedup, size, hold_s
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.error: str | None = None
+
+    def __enter__(self) -> SimVideo:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        if self.error:
+            log.warning("sim video %s: %s", self.path, self.error)
+
+    def _frame(self, r) -> np.ndarray:
+        w, h = self.size
+        img = r.render_qpos(self.world.qpos(), *self.world.mocap_state())
+        wrist = self.world.last_frame()
+        if wrist is not None:  # inset, top right
+            iw = w // 3
+            ih = int(wrist.shape[0] * iw / wrist.shape[1])
+            img[8:8 + ih, w - iw - 8:w - 8] = cv2.resize(wrist, (iw, ih), interpolation=cv2.INTER_AREA)
+            cv2.rectangle(img, (w - iw - 8, 8), (w - 8, 8 + ih), (255, 255, 255), 1)
+            cv2.putText(img, "wrist camera", (w - iw - 4, 24 + ih), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.rectangle(img, (0, h - 34), (w, h), (0, 0, 0), -1)
+        cv2.putText(img, self.caption[:90], (10, h - 11), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        cv2.putText(img, f"{self.speedup:g}x speed", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2)
+        return img
+
+    def _run(self) -> None:
+        from .viz import LiveRenderer
+
+        raw = self.path.with_suffix(".raw.mp4")
+        writer = None
+        try:
+            r = LiveRenderer(size=self.size, open_gap_m=self.world.open_gap_m, scene_path=SIM_SCENE_PATH)
+            r.cam.lookat[:] = self.LOOKAT
+            r.cam.distance, r.cam.azimuth, r.cam.elevation = self.DISTANCE, self.AZIMUTH, self.ELEVATION
+            writer = cv2.VideoWriter(str(raw), cv2.VideoWriter_fourcc(*"mp4v"), self.fps * self.speedup, self.size)
+            next_t = time.monotonic()
+            while True:
+                frame = self._frame(r)
+                writer.write(frame)
+                if self._stop.is_set():
+                    for _ in range(int(self.hold_s * self.fps * self.speedup)):  # last frame stays on screen
+                        writer.write(frame)
+                    break
+                next_t += 1.0 / self.fps
+                self._stop.wait(max(0.0, next_t - time.monotonic()))
+            r.close()
+        except Exception as e:  # noqa: BLE001 - a broken video must not break the run
+            self.error = repr(e)
+        finally:
+            if writer is not None:
+                writer.release()
+        err = encode_h264(raw, self.path)
+        if err:
+            self.error = err
+
+
+def encode_h264(raw: Path, path: Path) -> str | None:
+    """Re-encode `raw` as H.264 at `path` (OpenCV's mp4v does not play in browsers or on GitHub) and delete
+    `raw`. If ffmpeg is missing or fails, `raw` is moved to `path` as it is. Returns an error message or None."""
+    import shutil
+    import subprocess
+
+    raw, path = Path(raw), Path(path)
+    if not raw.exists():
+        return f"{raw} was not written"
+    err = "ffmpeg not found"
+    if shutil.which("ffmpeg"):
+        res = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw), "-c:v", "libx264", "-pix_fmt",
+                              "yuv420p", "-crf", "26", str(path)], capture_output=True, text=True, check=False)
+        if res.returncode == 0:
+            raw.unlink()
+            return None
+        err = f"ffmpeg: {res.stderr.strip()[:200]}"
+    raw.replace(path)
+    return err

@@ -286,3 +286,20 @@ Next
 ## Tests removed
 - Dropped the unit tests (tests/, pytest extra and config). The end-to-end check is now a simulated run:
   `scripts/grasp.py "red cube" --sim` (README "Setup").
+
+## 2026-11-27: Swappable reasoning model for the agent
+
+- The agent talks to a `Reasoner` (agent/reasoner.py): neutral messages in, reply + parsed tool call out.
+  Backend `hf` runs any transformers image-text chat model; spec strings like
+  `hf:Qwen/Qwen3-VL-4B-Instruct@4bit` in config `agent.reasoner` or `scripts/agent.py --reasoner`. When it is
+  the perception VLM's model, the loaded weights are shared. Runs record the reasoner name and per-step
+  time and tokens.
+- Sim, first agent run on multi-view depth: "put the red cube next to the blue can" done (cube ~5 cm to the
+  can's left), ~2 s per reasoning step.
+
+Future work
+- Hosted-API reasoner backends (GPT, Claude, Gemini) so the benchmark can compare them with local models,
+  the way labs evaluate models as a robot's high-level brain. Camera images and requests would go to the
+  provider, and each run costs API fees. Perception could later get the same plug.
+- Shapes in the air (e.g. "draw a heart"): a `move_gripper_path(points)` tool, the tip following points on
+  an upright plane in front of the robot via IK. Skipped for now; joint gestures (move_joints) cover nod / shake.

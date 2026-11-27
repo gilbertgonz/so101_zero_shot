@@ -20,11 +20,30 @@ import numpy as np
 from ..calibration.viewpoints import min_link_height, path_is_safe
 from ..config import RobotConfig
 from ..grasping.feedback import is_holding, read_grip
-from ..grasping.topdown import GraspPlan, GraspPlanningError, TopDownPlanner, grasp_height, object_axis_xy
+from ..grasping.topdown import (
+    GraspPlan,
+    GraspPlanningError,
+    TopDownPlanner,
+    grasp_height,
+    object_axis_xy,
+)
 from ..kinematics import SO101Kinematics
 from ..perception.geometry import FisheyeCamera, Rectifier
-from ..perception.locate import Locator, ObjectEstimate, OtherViews, PerceptionError, draw_debug
-from .motion_frames import MIN_BASELINE_M, Frame, LookSettings, MotionFrames, spread_frames
+from ..perception.locate import (
+    Locator,
+    ObjectEstimate,
+    OtherViews,
+    PerceptionError,
+    draw_debug,
+)
+from ..perception.scene_map import SceneMap
+from .motion_frames import (
+    MIN_BASELINE_M,
+    Frame,
+    LookSettings,
+    MotionFrames,
+    spread_frames,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +59,8 @@ TOUCH_STEP_M = 0.004
 TOUCH_SPEED = 8.0
 TOUCH_LAG_DEG = 1.5
 TOUCH_LOAD_RISE = 150.0
+# look(): base turn for a photo taken where the camera already was (~3 cm of camera travel at the scan pose)
+NUDGE_PAN_DEG = 10.0
 TRANSIT_Z_M = 0.13  # fingertips this high when travelling between spots (a held object hangs ~3-8 cm below)
 TOUCH_STANDOFF_M = 0.04
 TOUCH_REF_STEPS = 3  # 12 mm of free-air creep before the target can be reached
@@ -118,6 +139,22 @@ class Skills:
     # Frames from the last move_collecting() (for a photo at the pose it ended in); cleared by any other move.
     _move_frames: list[Frame] = field(default_factory=list, repr=False)
     last_photo: tuple[np.ndarray, np.ndarray] | None = field(default=None, repr=False)  # (fisheye BGR, joints)
+    # 3D map of the workspace for this run: every photo's depth is fused into it (perception/scene_map.py).
+    scene_map: SceneMap | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.scene_map is None:
+            self.scene_map = SceneMap(table_z_m=self.locator.table_z_m if self.locator is not None else 0.0)
+        if self.locator is not None:
+            self.locator.scene_map = self.scene_map  # one run at a time uses the locator
+
+    def save_map(self) -> list[Path]:
+        """Write the run's scene map (scene_map.ply, scene_map_height.png) to the run folder."""
+        if self.scene_map is None or self.scene_map.views == 0:
+            return []
+        paths = self.scene_map.save(self.out)
+        self.log["scene_map"] = {"views": self.scene_map.views, "files": [p.name for p in paths]}
+        return paths
 
     @property
     def rest(self) -> np.ndarray:
@@ -183,8 +220,9 @@ class Skills:
         """A photo plus the other views its depth is measured with, at no extra motion: the frames the
         camera passed on its way to `q_cmd` (or on the last move_collecting / go_scan if q_cmd is None),
         spread along the path, and `prior`, an earlier photo (default: the last photo before this move).
-        Views closer than MIN_BASELINE_M to this photo's camera are left out (no parallax). Returns
-        (fisheye BGR, joints, views) and saves <tag>_v<i>.jpg for each view."""
+        Views closer than MIN_BASELINE_M to this photo's camera are left out (no parallax). If that leaves
+        none (the camera has not moved since the last photo), the base turns NUDGE_PAN_DEG and back to get
+        some. Returns (fisheye BGR, joints, views) and saves <tag>_v<i>.jpg for each view."""
         if q_cmd is not None:
             if prior is None:
                 prior = self.last_photo
@@ -193,9 +231,14 @@ class Skills:
         frames = self._move_frames
         img, q = self.photo(None, tag)
         here = self._camera_center(q)
+        prior_ok = prior is not None and np.linalg.norm(self._camera_center(prior[1]) - here) >= MIN_BASELINE_M
         picked = spread_frames(frames, self._camera_center, self.look_settings.frames, exclude_near=here)
+        if not picked and not prior_ok:
+            frames = self._parallax_nudge(q)
+            picked = spread_frames(frames, self._camera_center, self.look_settings.frames, exclude_near=here)
+            self.log[f"{tag}_nudged"] = True
         views = [(f.bgr, f.joints_deg) for f in picked]
-        if prior is not None and np.linalg.norm(self._camera_center(prior[1]) - here) >= MIN_BASELINE_M:
+        if prior_ok:
             views.insert(0, prior)
         for i, (v_img, _) in enumerate(views):
             self.save_photo(v_img, f"{tag}_v{i}")
@@ -203,6 +246,23 @@ class Skills:
         if not views:
             logger.warning("%s: no other views to measure depth with", tag)
         return img, q, views
+
+    def _parallax_nudge(self, q: np.ndarray) -> list:
+        """Turn the base NUDGE_PAN_DEG (away from its nearer limit) and back, collecting frames both ways:
+        the views for a photo taken where the camera already was. Returns the frames."""
+        logger.info("no other views from here: turning the base %.0f deg and back", NUDGE_PAN_DEG)
+        lo, hi = (getattr(self.arm, "joint_limits", {}) or {}).get("shoulder_pan", (-np.inf, np.inf))
+        sign = 1.0 if q[0] + NUDGE_PAN_DEG <= hi else -1.0
+        if not lo <= q[0] + sign * NUDGE_PAN_DEG <= hi:
+            return []
+        out = np.array(q, dtype=float)
+        out[0] += sign * NUDGE_PAN_DEG
+        self.move_collecting(out)
+        frames = self._move_frames
+        self.move_collecting(np.asarray(q, dtype=float))
+        frames = frames + self._move_frames
+        self._move_frames = frames
+        return frames
 
     def save_photo(self, img: np.ndarray, tag: str) -> Path:
         path = self.out / f"{tag}.jpg"

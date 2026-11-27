@@ -16,18 +16,19 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from ..config import RUNS_DIR
 from ..grasping.runner import GraspRunner, RunResult
 from ..hardware import MotionStopped
 from ..perception.scene import Scene
 from ..skills import Session, Skills, add_step, new_run_dir
+from .reasoner import Message, Reasoner, ToolCall
 from .tools import TOOL_SPECS, Toolbox, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """You control a small robot arm (SO-101, 5 joints) with a two-finger gripper and one camera on its wrist. It stands on a table.
 Positions are in cm in the robot's base frame: x = forward (away from the robot), y = to the robot's left, z = up; the table is z = 0. Left and right mean as seen in the camera image, which is also the robot's left and right.
 Objects in the scene list have numbers: [3] is object 3, [H1] is a person's hand. The camera image shows each number on its object. Sizes and heights are rough (they can be off by about 3 cm); colors and names come from the camera.
-The robot can only do what the tools offer: look, pick up one object at a time from above, put it down, give it to a hand, touch, move above something. It cannot open or pour things, push or slide them, stack precisely, carry two things, or reach anything outside about x 10 to 32 cm, y -20 to 20 cm.
+The robot can only do what the tools offer: look, pick up one object at a time from above, put it down, give it to a hand, touch, move above something, and move its own joints (gestures). It cannot open or pour things, push or slide them, stack precisely, carry two things, or reach anything outside about x 10 to 32 cm, y -20 to 20 cm.
 Rules:
 - Call exactly one tool in each reply. Before the call, write one short sentence saying why.
 - Use the numbers from the latest scene list. If what you need is not in the list, use look_around, look_at or find_hands first.
@@ -56,7 +57,7 @@ Write a short numbered plan (at most 6 steps), one tool per step with its argume
 If what the request needs is not in the scene list, start with look_around or look_at. If the request cannot be done by this robot at all, answer only: CANNOT: <reason in one sentence>"""
 
 GO_PROMPT = ("The person approved the plan. Carry it out now: in each reply write one short sentence, then exactly "
-             "one tool call in <tool_call></tool_call> tags.")
+             "one tool call {call_hint}.")
 IMAGE_REMOVED = "(older camera image removed)"
 
 
@@ -72,123 +73,34 @@ class AgentConfig:
     look_first: bool = True
 
 
-@dataclass
-class ToolCall:
-    name: str
-    args: dict
-    thought: str
-    raw: str
-
-
-_ARG = re.compile(r"""\s*(?:(\w+)\s*[=:]\s*)?("[^"]*"|'[^']*'|[^,]+?)\s*(?:,|$)""")
-
-
-def _parse_value(v: str):
-    v = v.strip()
-    if v[:1] in "\"'" and v[-1:] == v[:1]:
-        return v[1:-1]
-    if v.lower() in ("true", "false"):
-        return v.lower() == "true"
-    try:
-        return float(v) if any(c in v for c in ".eE") else int(v)
-    except ValueError:
-        return v
-
-
-def _parse_call_text(text: str, names: list[str]) -> ToolCall | None:
-    """Fallback for replies that name the tool in plain text: `look_around`, `pick_up(id=3)`, `pick_up("3")`,
-    `place_at(20, -5)`. Positional values fill the tool's parameters in order."""
-    pat = re.compile(r"\b(" + "|".join(map(re.escape, names)) + r")\b\s*(\(([^()]*)\))?")
-    m = None
-    for m in pat.finditer(text):
-        break
-    if m is None:
-        return None
-    name, args = m.group(1), {}
-    params = list(next(t for t in TOOL_SPECS if t["function"]["name"] == name)["function"]["parameters"]["properties"])
-    if m.group(3) and m.group(3).strip():
-        body = m.group(3).strip()
-        if body.startswith("{"):
-            try:
-                args = json.loads(body)
-            except json.JSONDecodeError:
-                args = {}
-        else:
-            pos = 0
-            for km in _ARG.finditer(body):
-                if not km.group(2):
-                    continue
-                key = km.group(1)
-                if key is None:
-                    if pos >= len(params):
-                        break
-                    key, pos = params[pos], pos + 1
-                args[key] = _parse_value(km.group(2))
-    return ToolCall(name, args, text[:m.start()].strip(), text)
-
-
-def parse_tool_call(text: str) -> ToolCall | None:
-    """First tool call in a reply: <tool_call>{"name": ..., "arguments": {...}}</tool_call>, or a bare JSON
-    object with "name", or (fallback) a tool named in plain text. The text before it is the model's reason."""
-    dec = json.JSONDecoder()
-    m = re.search(r"<tool_call>", text)
-    starts = [m.end()] if m else []
-    starts += [i.start() for i in re.finditer(r"\{", text)]
-    for st in starts:
-        j = text.find("{", st)
-        if j < 0:
-            continue
-        try:
-            obj, _ = dec.raw_decode(text[j:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict) and isinstance(obj.get("name"), str):
-            args = obj.get("arguments", obj.get("parameters", {}))
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
-            thought = text[:m.start()] if m else text[:j]
-            return ToolCall(obj["name"], args if isinstance(args, dict) else {}, thought.strip(), text)
-    return _parse_call_text(text, [t["function"]["name"] for t in TOOL_SPECS])
-
-
-def _image_content(path: Path, max_side: int = 960):
-    from PIL import Image
-
+def _load_image(path: Path, max_side: int = 960) -> np.ndarray | None:
+    """RGB image from disk, shrunk so its longer side is at most max_side."""
     img = cv2.imread(str(path))
     if img is None:
         return None
     s = max_side / max(img.shape[:2])
     if s < 1:
         img = cv2.resize(img, (int(img.shape[1] * s), int(img.shape[0] * s)), interpolation=cv2.INTER_AREA)
-    return {"type": "image", "image": Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))}
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 @dataclass
 class Conversation:
-    """Chat history in the transformers format, keeping only the newest image."""
-    messages: list[dict] = field(default_factory=list)
+    """Chat history, keeping only the newest image."""
+    messages: list[Message] = field(default_factory=list)
 
-    def add(self, role: str, text: str, image: Path | None = None, tool_calls: list | None = None) -> None:
-        content = []
-        if image is not None:
-            item = _image_content(image)
-            if item is not None:
-                for msg in self.messages:  # drop older images
-                    msg["content"] = [c if c.get("type") != "image" else {"type": "text", "text": IMAGE_REMOVED}
-                                      for c in msg["content"]]
-                content.append(item)
-        content.append({"type": "text", "text": text})
-        msg = {"role": role, "content": content}
-        if tool_calls:
-            msg["tool_calls"] = tool_calls
-        self.messages.append(msg)
+    def add(self, role: str, text: str, image: Path | None = None, tool_call: ToolCall | None = None) -> None:
+        rgb = _load_image(image) if image is not None else None
+        if rgb is not None:
+            for msg in self.messages:  # drop older images
+                if msg.image is not None:
+                    msg.image, msg.text = None, f"{IMAGE_REMOVED} {msg.text}"
+        self.messages.append(Message(role, text, rgb, tool_call))
 
     def transcript(self) -> list[dict]:
-        return [{"role": m["role"], "text": " ".join(c.get("text", "[image]") for c in m["content"]),
-                 **({"tool_calls": m["tool_calls"]} if "tool_calls" in m else {})} for m in self.messages]
+        return [{"role": m.role, "text": m.text,
+                 **({"tool_call": {"name": m.tool_call.name, "args": m.tool_call.args}} if m.tool_call else {})}
+                for m in self.messages]
 
 
 def agent_steps() -> list[tuple[str, str]]:
@@ -196,26 +108,22 @@ def agent_steps() -> list[tuple[str, str]]:
 
 
 class Agent:
-    def __init__(self, runner: GraspRunner, vlm, cfg: AgentConfig | None = None):
-        """`runner` supplies the robot parts and the grasp sequence; `vlm` has generate(messages, max_new_tokens,
-        tools) (perception.pointer.VlmPointer)."""
-        self.runner, self.vlm = runner, vlm
+    def __init__(self, runner: GraspRunner, reasoner: Reasoner, cfg: AgentConfig | None = None):
+        """`runner` supplies the robot parts and the grasp sequence; `reasoner` plans and picks the tool calls
+        (agent.reasoner.build_reasoner)."""
+        self.runner, self.reasoner = runner, reasoner
         self.cfg = cfg or AgentConfig()
 
     @property
     def rep(self):
         return self.runner.rep
 
-    def _generate(self, conv: Conversation, tokens: int, tools: bool = True) -> tuple[str, float]:
-        t = time.monotonic()
-        text = self.vlm.generate(conv.messages, max_new_tokens=tokens, tools=TOOL_SPECS if tools else None)
-        return text.strip(), time.monotonic() - t
-
     def run(self, arm, camera, request: str, record: bool | None = None) -> RunResult:
         r = self.runner
         out = new_run_dir(r.runs_dir or RUNS_DIR, "agent")
         log: dict = {"query": request, "mode": "agent", "environment": r.environment,
-                     "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "agent": {"calls": []}}
+                     "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                     "agent": {"reasoner": self.reasoner.name, "calls": []}}
         s = Session(r.cfg, self.rep, out, log, r.environment, r.speed, r.cam_model)
         sk = r.skills(arm, camera, out, log)
         scene = Scene(r.locator, r.cfg.check_in_workspace)
@@ -249,7 +157,8 @@ class Agent:
             tools = ", ".join(f"{t['function']['name']}({', '.join(t['function']['parameters']['properties'])})"
                               for t in TOOL_SPECS)
             conv.add("user", PLAN_PROMPT.format(request=request, scene=scene.describe(), tools=tools), res.image)
-            plan, dt = self._generate(conv, self.cfg.plan_tokens, tools=False)
+            reply = self.reasoner.step(conv.messages, None, self.cfg.plan_tokens)
+            plan, dt = reply.text, reply.seconds
             log["agent"]["plan"] = plan
             s.event("agent_plan", text=plan)
             check_stop()
@@ -269,7 +178,7 @@ class Agent:
                 log["result"] = "aborted: plan declined"
                 return
             s.rep.step("approve", "done")
-            conv.add("user", GO_PROMPT)
+            conv.add("user", GO_PROMPT.format(call_hint=self.reasoner.call_hint))
 
             failed: dict[tuple, int] = {}  # (tool, args) -> failures, to stop the model repeating itself
             for n in range(1, self.cfg.max_steps + 1):
@@ -277,14 +186,15 @@ class Agent:
                 if time.monotonic() - t0 > self.cfg.max_time_s:
                     log["result"] = f"gave up: out of time after {n - 1} steps"
                     return
-                text, dt = self._generate(conv, self.cfg.step_tokens)
+                reply = self.reasoner.step(conv.messages, TOOL_SPECS, self.cfg.step_tokens)
+                text, dt, call = reply.text, reply.seconds, reply.tool_call
                 check_stop()
-                call = parse_tool_call(text)
                 sid = f"t{n}"
                 if call is None:
                     add_step(s.rep, sid, "(no tool call)")
                     s.rep.step(sid, "failed", text[:300])
-                    calls.append({"n": n, "raw": text, "error": "no tool call", "thinking_s": round(dt, 1)})
+                    calls.append({"n": n, "raw": text, "error": "no tool call", "thinking_s": round(dt, 1),
+                                  "tokens": reply.tokens})
                     conv.add("assistant", text)
                     conv.add("user", "Reply with exactly one tool call (use finish to end).")
                     continue
@@ -293,8 +203,7 @@ class Agent:
                 s.begin(sid)
                 s.rep.step(sid, "active", call.thought[:300])
                 s.event("tool_call", n=n, name=call.name, args=call.args, thought=call.thought)
-                conv.add("assistant", call.thought, tool_calls=[{"type": "function", "function": {
-                    "name": call.name, "arguments": call.args}}])
+                conv.add("assistant", call.thought, tool_call=call)
                 key = (call.name, json.dumps(call.args, sort_keys=True, default=str))
                 if failed.get(key, 0) >= 2 and call.name != "finish":
                     res = ToolResult(False, f"{call.name} with these arguments already failed twice; it will not be "
@@ -305,7 +214,8 @@ class Agent:
                 if not res.ok:
                     failed[key] = failed.get(key, 0) + 1
                 calls.append({"n": n, "name": call.name, "args": call.args, "thought": call.thought,
-                              "ok": res.ok, "result": res.text, "thinking_s": round(dt, 1)})
+                              "ok": res.ok, "result": res.text, "thinking_s": round(dt, 1),
+                              "tokens": reply.tokens})
                 s.event("tool_result", n=n, ok=res.ok, text=res.text)
                 s.save()
                 s.rep.step(sid, "done" if res.ok else "failed", res.text.split("\n")[0][:300],
@@ -318,7 +228,8 @@ class Agent:
             log["result"] = f"gave up: used all {self.cfg.max_steps} steps"
 
         def task() -> dict:
-            return {"type": "agent", "mode": "agent", "query": request, "object": tb.picked_id,
+            return {"type": "agent", "mode": "agent", "query": request, "reasoner": self.reasoner.name,
+                    "object": tb.picked_id,
                     "instruction": request, "plan": log["agent"].get("plan"),
                     "tools": [{"name": c.get("name"), "args": c.get("args"), "ok": c.get("ok")}
                               for c in log["agent"]["calls"]]}

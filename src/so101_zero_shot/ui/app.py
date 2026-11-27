@@ -332,8 +332,8 @@ class Backend:
             # Simulated runs (and their episodes) go to runs/sim/, away from the real-robot data.
             self.runner = GraspRunner(**parts, reporter=self.reporter, environment=self.environment,
                                       runs_dir=None if self.environment == "real" else RUNS_DIR / "sim")
-            from ..agent import Agent
-            self.agent = Agent(self.runner, parts["locator"].pointer)
+            from ..agent import Agent, build_reasoner
+            self.agent = Agent(self.runner, build_reasoner(shared_vlm=parts["locator"].pointer))
             self.hub.mutate(lambda s: s.status.update(models="ok"))
         except Exception as e:  # noqa: BLE001
             logger.exception("model loading failed")
@@ -380,7 +380,8 @@ class Backend:
                 r.set_view(*ROBOT_VIEWS.get(self.robot_view, ROBOT_VIEWS["3/4"]))
                 g = s.gripper_pct or 0.0
                 world = self.world
-                img = r.render_qpos(world.qpos()) if world is not None else r.render(np.array(s.joints_deg), g)
+                img = (r.render_qpos(world.qpos(), *world.mocap_state()) if world is not None
+                       else r.render(np.array(s.joints_deg), g))
                 target = s.target_deg
                 if target is not None and s.busy and np.max(np.abs(np.subtract(target, s.joints_deg))) > 2.0:
                     mask = r.arm_mask(np.array(target), g)

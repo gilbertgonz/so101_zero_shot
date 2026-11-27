@@ -8,8 +8,10 @@ Usage:
   agent.py "put the red cube next to the blue can" --sim
   agent.py "give me a high five" --sim --hand-five       sim: hold up a hand for a high five
   agent.py REQUEST                                      on the real arm
+  --reasoner SPEC  reasoning model, e.g. hf:Qwen/Qwen3-VL-8B-Instruct@4bit (default: config agent.reasoner)
   --yes          approve everything automatically (sim testing)
   --no-record    do not save an episode
+  --video PATH   sim: save a video of the run (3/4 view + wrist camera, 4x speed)
 
 Runs go to runs/agent_<time>/ (runs/sim/ in the simulation).
 """
@@ -18,8 +20,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 
-from so101_zero_shot.agent import Agent, AgentConfig
+from so101_zero_shot.agent import Agent, AgentConfig, build_reasoner
 from so101_zero_shot.config import RUNS_DIR
 from so101_zero_shot.grasping.runner import GraspRunner
 from so101_zero_shot.grasping.setup import build_runner_parts
@@ -63,9 +66,11 @@ def main() -> None:
     ap.add_argument("request")
     ap.add_argument("--sim", action="store_true")
     ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--reasoner", default=None, help="backend:model[@options] (default: config agent.reasoner)")
     ap.add_argument("--no-record", action="store_true")
     ap.add_argument("--speed", type=float, default=30.0)
     ap.add_argument("--max-steps", type=int, default=AgentConfig.max_steps)
+    ap.add_argument("--video", default=None, help="sim: save a video of the run (mp4, 4x speed)")
     ap.add_argument("--hand-five", action="store_true", help="sim: a hand held up for a high five")
     ap.add_argument("--hand-down", action="store_true", help="sim: a hand lying palm down on the table")
     args = ap.parse_args()
@@ -75,7 +80,9 @@ def main() -> None:
     rep = ConsoleReporter(args.yes)
     runner = GraspRunner(**parts, reporter=rep, speed_deg_s=args.speed, environment="sim" if args.sim else "real",
                          runs_dir=RUNS_DIR / "sim" if args.sim else None)
-    agent = Agent(runner, parts["locator"].pointer, AgentConfig(max_steps=args.max_steps))
+    reasoner = build_reasoner(args.reasoner, shared_vlm=parts["locator"].pointer)
+    print(f"reasoner: {reasoner.name}")
+    agent = Agent(runner, reasoner, AgentConfig(max_steps=args.max_steps))
     cfg, world = parts["cfg"], None
     if args.sim:
         from so101_zero_shot.mujoco_sim import SimWorld, SimWristCamera, make_mujoco_arm
@@ -83,9 +90,9 @@ def main() -> None:
         world = SimWorld(cfg, parts["cam_model"])
         world.start()
         if args.hand_five:
-            world.set_hand(*HAND_FIVE)
+            world.set_hand(*world.HAND_PLACEMENTS["five"])
         elif args.hand_down:
-            world.set_hand(*HAND_DOWN)
+            world.set_hand(*world.HAND_PLACEMENTS["down"])
         camera, arm = SimWristCamera(world), make_mujoco_arm(cfg, world)
     else:
         camera = cfg.make_camera()
@@ -93,7 +100,18 @@ def main() -> None:
         arm = cfg.make_arm()
         arm.connect(enable_torque=False)
     try:
-        res = agent.run(arm, camera, args.request, record=False if args.no_record else None)
+        from contextlib import nullcontext
+
+        if args.video and world is not None:
+            from so101_zero_shot.mujoco_sim import SimVideo
+            recorder = SimVideo(world, args.video, f'"{args.request}"')
+        else:
+            recorder = nullcontext()
+        with recorder:
+            res = agent.run(arm, camera, args.request, record=False if args.no_record else None)
+            if args.video and world is not None:
+                recorder.caption = f'"{args.request}" -> {res.result}'
+                time.sleep(0.3)
         print(f"\n{res.result}\n{res.out_dir}")
         if world is not None:
             print("objects now:", world.object_positions())
@@ -105,10 +123,6 @@ def main() -> None:
         if world is not None:
             world.close()
 
-
-# Sim hand placements (palm centre, pose, yaw) shared with the benchmark.
-HAND_FIVE = ([0.34, 0.0, 0.10], "high_five", 0.0)
-HAND_DOWN = ([0.24, 0.08, 0.035], "palm_down", 150.0)
 
 if __name__ == "__main__":
     main()
