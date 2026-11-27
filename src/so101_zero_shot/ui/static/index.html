@@ -475,7 +475,6 @@ const map3d = (() => {
   }
 
   function draw() {
-    dirty = false;
     const dpr = window.devicePixelRatio || 1, w = Math.round(wrap.clientWidth * dpr), h = Math.round(wrap.clientHeight * dpr);
     if (!w || !h) return;
     for (const c of [glc, lc]) if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
@@ -514,7 +513,8 @@ const map3d = (() => {
     label([7.5, 0, 0], "x forward", "#ef5350"); label([0, 7.5, 0], "y left", "#39c07f");
     const arm = (data && data.arm) || []; if (arm.length) label(arm[arm.length - 1], "gripper", "#00dcff");
   }
-  const redraw = () => { if (!dirty) { dirty = true; requestAnimationFrame(() => active && draw()); } };
+  // At most one frame queued; the flag is cleared when it runs, even if the tab was hidden by then.
+  const redraw = () => { if (!dirty) { dirty = true; requestAnimationFrame(() => { dirty = false; if (active) draw(); }); } };
 
   async function poll() {
     if (!active) return;

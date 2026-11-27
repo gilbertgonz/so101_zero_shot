@@ -60,6 +60,11 @@ TRANSIT_Z_M = 0.13  # fingertips this high when travelling between spots (a held
 PATH_STEP_M = 0.015
 PATH_MIN_Z_M = 0.01
 PATH_MAX_JUMP_DEG = 25.0
+# place_at: (above the drop point before, after) in m. The pick's own hover heights first; then lower ones,
+# which a high drop (on top of something) needs: fingers pointing straight down only reach ~9 cm up.
+PLACE_HOVERS_M = ((0.05, 0.07), (0.03, 0.03))
+PLACE_SCAN_X_M = np.arange(0.10, 0.33, 0.02)  # where a failed place_at looks for x values that do work
+PLACE_CLEAR_M = 0.04  # after letting go, fingertips rise straight up to this far above the placed object's top
 
 
 class SkillFailed(Exception):
@@ -73,6 +78,11 @@ class Held:
     plan: GraspPlan  # the grasp it was picked with: plan.target_m is the fingertip point on the object
     picked_from_m: np.ndarray  # object top-centre where it was picked
     top_z_m: float  # its height
+
+    @property
+    def hang_m(self) -> float:
+        """How far its bottom hangs below the fingertips (it stood on the table when it was picked)."""
+        return float(self.plan.target_m[2])
 
 
 @dataclass
@@ -472,19 +482,55 @@ class Skills:
         if self.held is None:
             raise SkillFailed("not holding anything")
         h = self.held
-        target = np.array([xy_m[0], xy_m[1], on_z_m + h.plan.target_m[2] + 0.005])
+        target = np.array([xy_m[0], xy_m[1], on_z_m + h.hang_m + 0.005])
+        q = self.arm.read_joints()
+        where = f"x={xy_m[0] * 100:.0f} y={xy_m[1] * 100:.0f} cm" + (f", {on_z_m * 100:.0f} cm up" if on_z_m >= 0.005 else "")
         try:
             self.cfg.check_in_workspace(target)
-            plan = self.planner.plan_grasp(target, None, self.arm.read_joints())
-        except (ValueError, GraspPlanningError) as e:
-            raise SkillFailed(f"cannot place there: {e}") from e
+        except ValueError as e:
+            raise SkillFailed(f"cannot set it down at {where}: that is outside the arm's reach") from e
+        plan = self._place_plan(target, q)
+        if plan is None:
+            ok_x = [x for x in PLACE_SCAN_X_M if self._place_plan(np.array([x, target[1], target[2]]), q) is not None]
+            hint = (f"at y={xy_m[1] * 100:.0f} cm and this height it can set things down from x={ok_x[0] * 100:.0f} "
+                    f"to {ok_x[-1] * 100:.0f} cm" if ok_x else "nowhere along that y at this height")
+            raise SkillFailed(f"cannot set it down at {where}: the arm cannot hold it straight above that spot "
+                              f"({hint})")
         self.travel_to(plan.pregrasp_deg)
         self._drive(plan.grasp_deg, speed=DESCEND_SPEED)
         self.arm.set_gripper(OPEN_PCT, duration_s=0.8)
         self._drive(plan.lift_deg, speed=DESCEND_SPEED)
-        self.arm.set_gripper(0.0, duration_s=0.6)
         self.held = None
-        return np.array([xy_m[0], xy_m[1], on_z_m + h.top_z_m])
+        top = on_z_m + h.top_z_m
+        self._rise(top + PLACE_CLEAR_M)  # clear of it before closing and moving on, or the fingers knock it over
+        self.arm.set_gripper(0.0, duration_s=0.6)
+        return np.array([xy_m[0], xy_m[1], top])
+
+    def _rise(self, to_z_m: float) -> None:
+        """Fingertips straight up to height to_z_m (in PATH_STEP_M steps), as far as the arm can go."""
+        q = self.arm.read_joints()
+        tip = self.kin.fk(q)[:3, 3]
+        n = int(np.ceil((to_z_m - tip[2]) / PATH_STEP_M))
+        for z in np.linspace(tip[2], to_z_m, n + 1)[1:] if n > 0 else []:
+            try:
+                q_next, _ = self._solve_near(np.array([tip[0], tip[1], z]), q)
+            except SkillFailed:
+                break
+            if np.max(np.abs(q_next - q)) > PATH_MAX_JUMP_DEG:
+                break
+            self._drive(q_next, speed=DESCEND_SPEED)
+            q = q_next
+
+    def _place_plan(self, target_m: np.ndarray, q: np.ndarray) -> GraspPlan | None:
+        """A top-down plan to bring the held object's fingertip point to target_m, trying PLACE_HOVERS_M in
+        order; None if none works."""
+        for pre, lift in PLACE_HOVERS_M:
+            try:
+                return self.planner.plan_grasp(target_m, None, q, pregrasp_height_m=pre, lift_height_m=lift)
+            except GraspPlanningError as e:
+                logger.debug("place plan at %s (hover %.0f/%.0f cm): %s", np.round(target_m * 100, 1),
+                             pre * 100, lift * 100, e)
+        return None
 
     def _solve_near(self, point_m: np.ndarray, q_prev: np.ndarray) -> tuple[np.ndarray, str]:
         """Like solve(), but of the valid solutions (down, forward, any angle) the one closest to q_prev, so a

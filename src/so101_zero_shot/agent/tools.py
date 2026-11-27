@@ -135,7 +135,15 @@ class Toolbox:
         return self.scene.get(ref)
 
     def _scene_text(self) -> str:
-        return "Scene now:\n" + self.scene.describe()
+        return "Scene now:\n" + self.scene.describe() + self._holding_text()
+
+    def _holding_text(self) -> str:
+        """What the gripper holds and how far it hangs below the fingertips (move_gripper moves the
+        fingertips, so a held object's bottom is this much lower)."""
+        h = self.sk.held
+        if h is None or self.picked_id is None:
+            return ""
+        return f"\nHolding {self.picked_id}: its bottom hangs about {h.hang_m * 100:.0f} cm below the fingertips."
 
     # ------------------------------------------------------------------ perception
     def _look(self, q_cmd: np.ndarray | None, tag: str, hands: bool = True):
@@ -207,7 +215,8 @@ class Toolbox:
             return ToolResult(False, f"missed {o.name}: the gripper closed on nothing.")
         self.picked_id = o.name
         self.scene.set_held(o.name, True)
-        return ToolResult(True, f"Holding {o.name} ({o.label}).")
+        return ToolResult(True, f"Holding {o.name} ({o.label}); its bottom hangs about "
+                                f"{self.sk.held.hang_m * 100:.0f} cm below the fingertips.")
 
     def _held_obj(self) -> SceneObject | None:
         try:
@@ -303,6 +312,8 @@ class Toolbox:
         tip = self.sk.tip()
         text = f"Moved the gripper through {len(pts)} point(s); it is now at " + \
                "[{:.0f}, {:.0f}, {:.0f}] cm".format(*(tip * 100)) + "."
+        if held is not None and self.sk.held is not None:
+            text += f" The bottom of {held} is at about z={(tip[2] - self.sk.held.hang_m) * 100:.0f} cm."
         short = float(np.linalg.norm(tip - pts[-1]))
         if short > PATH_SHORT_M:
             text += (f" It stopped {short * 100:.0f} cm short of the last point: something was in the way "
@@ -310,6 +321,8 @@ class Toolbox:
         if gripper == "open" and held is not None:
             self._after_release(None)
             text += f" Opened the gripper and let go of {held}; look around to see where it landed."
+        elif gripper == "close" and held is not None:
+            text += f" Still holding {held} (the gripper was already closed on it); opening it lets go."
         elif gripper:
             text += f" Gripper {'opened' if gripper == 'open' else 'closed'}."
         return ToolResult(True, text)
