@@ -21,8 +21,11 @@
         <material name="blue" rgba="0.12 0.30 0.85 1" />
         <material name="yellow" rgba="0.95 0.80 0.10 1" />
         <material name="green" rgba="0.15 0.65 0.25 1" />
-        <material name="marker_body" rgba="0.08 0.08 0.08 1" />
-        <material name="marker_band" rgba="0.92 0.92 0.92 1" />
+        <!-- Permanent marker: printed barrel (make_marker.py writes the mesh and label), black cap and clip. -->
+        <texture type="2d" name="marker_label" file="assets/marker_label.png" />
+        <material name="marker_label" texture="marker_label" specular="0.2" />
+        <material name="marker_black" rgba="0.06 0.06 0.06 1" specular="0.3" />
+        <mesh name="marker_barrel" file="marker_barrel.obj" />
         <material name="skin" rgba="0.87 0.67 0.54 1" />
         <material name="sleeve" rgba="0.25 0.32 0.45 1" />
     </asset>
@@ -46,7 +49,7 @@
             <freejoint />
             <geom class="object" type="box" size="0.015 0.015 0.015" material="red" mass="0.03" />
         </body>
-        <body name="blue_can" pos="0.27 -0.07 0.035">
+        <body name="blue_cylinder" pos="0.27 -0.07 0.035">
             <freejoint />
             <geom class="object" type="cylinder" size="0.016 0.035" material="blue" mass="0.05" />
         </body>
@@ -54,10 +57,16 @@
             <freejoint />
             <geom class="round" type="sphere" size="0.02" material="yellow" mass="0.03" />
         </body>
-        <body name="marker" pos="0.29 0.02 0.009" euler="90 0 0">
+        <!-- Lying on the table, axis along y (cap toward +y). Collides as one capsule (hidden, group 3); the
+             barrel, cap, clip and end plug are looks only. -->
+        <body name="marker" pos="0.29 0.02 0.0095" quat="0.7071068 -0.7071068 0 0">
             <freejoint />
-            <geom class="round" type="capsule" size="0.009 0.05" material="marker_body" mass="0.02" />
-            <geom class="round" type="cylinder" size="0.0095 0.012" pos="0 0 -0.02" material="marker_band" mass="0.002" />
+            <geom class="round" type="capsule" fromto="0 0 -0.046 0 0 0.058" size="0.0095" mass="0.02" group="3" />
+            <geom type="mesh" mesh="marker_barrel" material="marker_label" contype="0" conaffinity="0" mass="0.0005" />
+            <geom type="cylinder" size="0.0098 0.016" pos="0 0 0.046" material="marker_black" contype="0" conaffinity="0" mass="0.0005" />
+            <geom type="sphere" size="0.0098" pos="0 0 0.0615" material="marker_black" contype="0" conaffinity="0" mass="0.0005" />
+            <geom type="box" size="0.0025 0.0012 0.013" pos="0 -0.0111 0.045" material="marker_black" contype="0" conaffinity="0" mass="0.0005" />
+            <geom type="cylinder" size="0.0092 0.0025" pos="0 0 -0.0475" material="marker_black" contype="0" conaffinity="0" mass="0.0005" />
         </body>
         <body name="green_block" pos="0.30 -0.13 0.02" euler="0 0 30">
             <freejoint />

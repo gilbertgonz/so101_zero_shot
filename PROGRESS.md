@@ -303,3 +303,95 @@ Future work
   provider, and each run costs API fees. Perception could later get the same plug.
 - Shapes in the air (e.g. "draw a heart"): a `move_gripper_path(points)` tool, the tip following points on
   an upright plane in front of the robot via IK. Skipped for now; joint gestures (move_joints) cover nod / shake.
+
+## 2026-11-27: Harder 5-task benchmark, reasoning aids, 4B vs 8B
+
+Benchmark (scripts/benchmark.py) is now 5 hard tasks, each run 3 times on a shifted scene (objects moved up
+to 2 cm and turned; repeat i uses seed i, so every reasoner sees the same scenes): closest object, "5 cm
+closer", "between the red cube and the blue can", "marker and red cube next to the can" (marker starts far
+left), and a missing object. Mosaic: a column per task, a row per repeat. `--seeds 1` reruns one scene.
+
+Changes and what each did (sim, score out of 15; success 1, partial 0.5):
+
+| run | closest | closer | between | tidy | missing | total |
+|---|---|---|---|---|---|---|
+| 4B, before | 0 | 1.5 | 0.5 | 2.0 | 0.5 | 4.5 (30%) |
+| 4B + reasoning aids, map fix | 0 | 1.5 | 0 | 3.0 | 1.5 | 6.0 (40%) |
+| 4B + tilted look-around | 3.0 | 1.5 | 2.0 | 3.0 | 2.5 | 12.0 (80%) |
+| 8B (Qwen3-VL-8B, 4-bit), same | 3.0 | 3.0 | 2.5 | 3.0 | 1.0 | 12.5 (83%) |
+
+(Runs: benchmark_20261127_022202 + _025613 (seed 1 redone), _030630, _033354, _035911. "tidy" scored with
+the marker's own next-to limit, see below; the first two rows are rescored with it.)
+
+- Reasoning aids: scene list sorted closest first and tagged CLOSEST / FURTHEST / TALLEST; `place_shifted
+  (closer_cm, left_cm)` from where the object was picked up; the first finish(success=true) gets the request
+  and the list of what was actually done back, once; a fourth look_around is refused ("not on the table,
+  finish false"); prompt rules: never substitute another object, move_joints only for asked-for gestures
+  (the model used it to "line up" grasps and knocked the can over).
+- Biggest single fix was perception, not reasoning: at the scan pose the gripper jaw hides the table nearest
+  the robot (x < ~20 cm), so the closest object (the yellow ball) was never seen. Look-around views now tilt
+  the wrist 12 deg further down (agent/tools.py LOOK_TILT_DEG); everything from x 15 to 32 cm stays in view.
+- 3D map free-spot check was refusing almost every spot: multi-view depth leaves the bare table 1-2 cm
+  uneven in the map, and the check flagged anything over 1.2 cm. It now measures from the local table level
+  (ring around the spot) and needs a cluster of cells over 1.5 cm.
+- Sim fix: shifted objects could start overlapping (seed 1 put the can into the green block), get thrown
+  apart and roll. reset() now redraws overlapping layouts.
+- Scoring fix: "next to" for the 13 cm marker allows 13 cm centre distance (same ~5 cm gap as 10 cm for
+  the cube); place_next_to itself puts it about 11 cm away.
+- 8B vs 4B: same perception (the 4B still finds objects; only the reasoner changes; 11.7 GB GPU total). The
+  8B does the arithmetic (5.0 cm closer, ball on the line between) where the 4B is off by 2-12 cm; ~3.7 s per
+  step vs ~2.5 s. Both still substitute another object for a missing one ("picked up the purple bottle"
+  while holding the marker); the completion check catches it 2 of 3 times for the 8B.
+- Grasp miss on the tall can (4B runs): grasp point 1.2 cm off across the closing direction, a finger lands
+  on the can's rim, closes on air.
+
+Next
+- Missing object: check the picked object's label against the request in code before success.
+- Tall-object grasp accuracy (can).
+- Real arm: the look tilt and the map's table noise need checking there.
+
+## 2026-11-27: General tools (pick_up, place_at, move_gripper), new tasks, reasoning in the UI
+
+Tools cut from 13 to 8, all general: look_around, look_at, find_hands, pick_up, place_at, move_gripper,
+go_home, finish. place_next_to, place_shifted, put_back, give_to_hand, touch, move_above and move_joints are
+gone; anything they did is now place_at or a move_gripper path.
+- move_gripper(waypoints, gripper): fingertips through a list of [x, y, z] cm points, straight lines between
+  them (1.5 cm steps; travels high to the first point), optional open / close at the end (opening while
+  holding lets go). Each step's IK picks the solution nearest the previous pose (`Skills._solve_near`), so a
+  straight lift does not flip the wrist. Refuses paths into the table, into the arm, below 1 cm, or with a
+  joint jump over 25 deg. If the tip stops more than 1.5 cm short, the result says something was in the way.
+  Paths within 12 cm of a seen hand ask for approval.
+- Prompt is general: "use the most applicable tool; when no tool does what a step needs, use move_gripper".
+  No gesture or task-specific hints.
+- `Skills.move_joints` is now the private `_drive` (only the skills call it). The sim hand's high-five pose
+  and `scripts/agent.py --hand-five` are removed (palm down only).
+- Sim: a permanent marker (white printed barrel, black cap, clip, end plug; `assets/so101/make_marker.py`
+  makes its mesh and label) replaces the black capsule, which the VLM never read as a writing tool. "blue
+  can" is "blue cylinder" everywhere.
+
+Benchmark tasks: "closest" became "pick up something I can write with" (write); "closer" became "knock over
+the blue cylinder" (knock, scored on the cylinder's top dropping; picking it up and dropping it is partial).
+
+| run | write | knock | between | tidy | missing | total |
+|---|---|---|---|---|---|---|
+| 4B (Qwen3-VL-4B, 4-bit) | 2.0 | 0.5 | 1.5 | 1.5 | 1.5 | 7.0 (47%) |
+
+(benchmark_20261127_100157; not comparable with the last table, two tasks are new and the tools changed.)
+- write: the marker is identified and lifted every time; runs then wander (place it somewhere, run out of
+  steps) instead of finishing.
+- knock: the model does reach for move_gripper on its own, but every path comes straight down onto the
+  cylinder; the open fingers straddle it. It never pushes sideways. Once it closed on it and lifted it. A
+  scripted sideways sweep at z 5 cm and a front push at z 4 cm both knock it over, so the tool can do it;
+  this is a reasoning gap.
+- tidy / between: place_at's free-spot check answers "taken" and the 4B walks the target 1 cm at a time
+  (x 19, 20, ... 33) until the step budget runs out. Same in the live UI test ("put the red cube next to the
+  yellow ball", 16 steps of "taken").
+- UI: general wording (Ask is the main action, quick grasp is a secondary row, no "plan grasp" when idle),
+  and a "Model reasoning" panel: the plan, each thought, call and result, the completion check, the final
+  answer, and a live "thinking" line (also over the camera).
+
+Next
+- place_at: on "taken", suggest the nearest free spot in the reply instead of only refusing.
+- knock: see whether better tool feedback (where the fingers touched) leads to a sideways push, without
+  task hints in the prompt.
+- write: finish once the request is met instead of also placing the object.

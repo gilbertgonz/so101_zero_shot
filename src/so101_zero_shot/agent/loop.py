@@ -5,7 +5,9 @@
   3. the person approves the plan once
   4. loop: the model sees the request, the plan, the latest marked camera view and every tool result so
      far, and calls one tool (one JSON function call). Grasps and moves toward a hand ask for approval.
-     It ends with finish(success, message), or when the step / time budget runs out.
+     It ends with finish(success, message), or when the step / time budget runs out. The first
+     finish(success=true) is answered with a check instead: the request again and the list of what was
+     actually done, so a multi-part request is not called done halfway.
 
 Only the latest camera image is kept in the model's context (older ones are replaced by a note), so a
 long run does not slow down or run out of memory. Every tool call and result is shown as a step in the
@@ -27,7 +29,7 @@ from ..config import RUNS_DIR
 from ..grasping.runner import GraspRunner, RunResult
 from ..hardware import MotionStopped
 from ..perception.scene import Scene
-from ..skills import Session, Skills, add_step, new_run_dir
+from ..skills import Session, Skills, add_step, new_run_dir, reasoning
 from .reasoner import Message, Reasoner, ToolCall
 from .tools import TOOL_SPECS, Toolbox, ToolResult
 
@@ -36,11 +38,15 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """You control a small robot arm (SO-101, 5 joints) with a two-finger gripper and one camera on its wrist. It stands on a table.
 Positions are in cm in the robot's base frame: x = forward (away from the robot), y = to the robot's left, z = up; the table is z = 0. Left and right mean as seen in the camera image, which is also the robot's left and right.
 Objects in the scene list have numbers: [3] is object 3, [H1] is a person's hand. The camera image shows each number on its object. Sizes and heights are rough (they can be off by about 3 cm); colors and names come from the camera.
-The robot can only do what the tools offer: look, pick up one object at a time from above, put it down, give it to a hand, touch, move above something, and move its own joints (gestures). It cannot open or pour things, push or slide them, stack precisely, carry two things, or reach anything outside about x 10 to 32 cm, y -20 to 20 cm.
+The robot can look, pick up one object at a time from above, put it down on the table, and move its gripper along any path of 3D points, opening or closing it at the end. It reaches about x 10 to 32 cm, y -20 to 20 cm, z 1 to 25 cm, and cannot carry two things at once.
 Rules:
 - Call exactly one tool in each reply. Before the call, write one short sentence saying why.
+- Use the most applicable tool for each step. When no tool does what a step needs, use move_gripper: with the right points it can make almost any motion.
+- pick_up and place_at aim by themselves; do not move the gripper first to line them up.
 - Use the numbers from the latest scene list. If what you need is not in the list, use look_around, look_at or find_hands first.
+- Distances, sides and sizes are already worked out in the scene list (closest first, CLOSEST, FURTHEST, TALLEST); use them instead of guessing from the image.
 - After a failure, think about the reason and try something different; try the same thing at most twice.
+- If the request names an object that is still not in the scene list after looking around, it is not on the table: call finish with success false and say so. Never use a different object instead.
 - When the request is done, or cannot be done, call finish with success true or false and a short message for the person."""
 
 PLAN_PROMPT = """Request from the person: "{request}"
@@ -52,13 +58,18 @@ Tools: {tools}
 
 Write a short numbered plan (at most 6 steps), one tool per step with its arguments, for example:
 1. pick_up(id="2")
-2. place_next_to(id="4", side="left")
+2. place_at(x_cm=20, y_cm=5)
 3. finish(success=true, message="Done.")
 If what the request needs is not in the scene list, start with look_around or look_at. If the request cannot be done by this robot at all, answer only: CANNOT: <reason in one sentence>"""
 
 GO_PROMPT = ("The person approved the plan. Carry it out now: in each reply write one short sentence, then exactly "
              "one tool call {call_hint}.")
 IMAGE_REMOVED = "(older camera image removed)"
+CHECK_PROMPT = """Before finishing, check the request once more: "{request}"
+Done so far:
+{done}
+Is every part of the request done? If yes, call finish again. If not, do the missing part now."""
+ACTION_TOOLS = ("pick_up", "place_at", "move_gripper")
 
 
 @dataclass
@@ -101,6 +112,10 @@ class Conversation:
         return [{"role": m.role, "text": m.text,
                  **({"tool_call": {"name": m.tool_call.name, "args": m.tool_call.args}} if m.tool_call else {})}
                 for m in self.messages]
+
+
+def _truthy(v) -> bool:
+    return v if isinstance(v, bool) else str(v).lower() in ("true", "yes", "1")
 
 
 def agent_steps() -> list[tuple[str, str]]:
@@ -157,6 +172,7 @@ class Agent:
             tools = ", ".join(f"{t['function']['name']}({', '.join(t['function']['parameters']['properties'])})"
                               for t in TOOL_SPECS)
             conv.add("user", PLAN_PROMPT.format(request=request, scene=scene.describe(), tools=tools), res.image)
+            reasoning(s.rep, "thinking", "writing a plan")
             reply = self.reasoner.step(conv.messages, None, self.cfg.plan_tokens)
             plan, dt = reply.text, reply.seconds
             log["agent"]["plan"] = plan
@@ -165,10 +181,12 @@ class Agent:
             if plan.upper().lstrip("* ").startswith("CANNOT"):
                 reason = plan.split(":", 1)[-1].strip() or plan
                 s.rep.step("plan", "done", f"cannot do it: {reason}", {"thinking_s": round(dt, 1)})
+                reasoning(s.rep, "refused", reason)
                 log["result"] = f"refused: {reason}"
                 log["agent"]["message"] = reason
                 return
             s.rep.step("plan", "done", plan, {"thinking_s": round(dt, 1)})
+            reasoning(s.rep, "plan", plan)
             conv.add("assistant", plan)
 
             s.begin("approve")
@@ -181,17 +199,20 @@ class Agent:
             conv.add("user", GO_PROMPT.format(call_hint=self.reasoner.call_hint))
 
             failed: dict[tuple, int] = {}  # (tool, args) -> failures, to stop the model repeating itself
+            checked = False  # the completion check was shown
             for n in range(1, self.cfg.max_steps + 1):
                 check_stop()
                 if time.monotonic() - t0 > self.cfg.max_time_s:
                     log["result"] = f"gave up: out of time after {n - 1} steps"
                     return
+                reasoning(s.rep, "thinking", f"step {n}: choosing the next tool")
                 reply = self.reasoner.step(conv.messages, TOOL_SPECS, self.cfg.step_tokens)
                 text, dt, call = reply.text, reply.seconds, reply.tool_call
                 check_stop()
                 sid = f"t{n}"
                 if call is None:
                     add_step(s.rep, sid, "(no tool call)")
+                    reasoning(s.rep, "reply", text)
                     s.rep.step(sid, "failed", text[:300])
                     calls.append({"n": n, "raw": text, "error": "no tool call", "thinking_s": round(dt, 1),
                                   "tokens": reply.tokens})
@@ -202,9 +223,23 @@ class Agent:
                 add_step(s.rep, sid, label)
                 s.begin(sid)
                 s.rep.step(sid, "active", call.thought[:300])
+                reasoning(s.rep, "thought", call.thought)
+                reasoning(s.rep, "call", label)
                 s.event("tool_call", n=n, name=call.name, args=call.args, thought=call.thought)
                 conv.add("assistant", call.thought, tool_call=call)
                 key = (call.name, json.dumps(call.args, sort_keys=True, default=str))
+                if call.name == "finish" and not checked and _truthy(call.args.get("success")):
+                    checked = True
+                    done = [f"- {c['name']}({', '.join(f'{k}={v}' for k, v in c['args'].items())}): "
+                            f"{c['result'].splitlines()[0]}" for c in calls if c.get("ok") and c.get("name") in ACTION_TOOLS]
+                    res = ToolResult(False, CHECK_PROMPT.format(request=request, done="\n".join(done) or "- nothing yet"))
+                    calls.append({"n": n, "name": call.name, "args": call.args, "thought": call.thought,
+                                  "ok": False, "result": "completion check", "thinking_s": round(dt, 1),
+                                  "tokens": reply.tokens})
+                    s.rep.step(sid, "done", "check: is every part of the request done?")
+                    conv.add("tool", res.text, None)
+                    reasoning(s.rep, "check", res.text)
+                    continue
                 if failed.get(key, 0) >= 2 and call.name != "finish":
                     res = ToolResult(False, f"{call.name} with these arguments already failed twice; it will not be "
                                             "tried again. Do something different (look around, another object, "
@@ -223,8 +258,10 @@ class Agent:
                 if res.done:
                     log["agent"]["message"] = res.text
                     log["result"] = ("done: " if res.ok else "failed: ") + (res.text or "-")
+                    reasoning(s.rep, "finished", log["result"])
                     return
                 conv.add("tool", ("OK. " if res.ok else "FAILED. ") + res.text, res.image)
+                reasoning(s.rep, "result", ("OK. " if res.ok else "FAILED. ") + res.text.split("\nScene now:")[0])
             log["result"] = f"gave up: used all {self.cfg.max_steps} steps"
 
         def task() -> dict:

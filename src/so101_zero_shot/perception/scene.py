@@ -82,7 +82,6 @@ class SceneObject:
     held: bool = False  # in the gripper
     covered_by_hand: float = 0.0  # share of its footprint under a hand (objects only)
     reachable: bool | None = None
-    felt_top_z_m: float | None = None  # top height measured by touching it (beats the camera estimate)
 
     @property
     def name(self) -> str:
@@ -95,9 +94,6 @@ class SceneObject:
         parts = [f'[{self.name}] "{self.label}"', f"at x={c[0]:.0f} y={c[1]:+.0f} cm ({side}, {dist:.0f} cm from the base)"]
         if self.kind == "hand":
             parts.append(f"{self.top_z_m * 100:.0f} cm above the table")
-        elif self.felt_top_z_m is not None:
-            parts.append(f"{self.length_m * 100:.0f} x {self.width_m * 100:.0f} cm footprint, "
-                         f"{self.felt_top_z_m * 100:.1f} cm tall (measured by touch)")
         else:
             parts.append(f"{self.length_m * 100:.0f} x {self.width_m * 100:.0f} cm footprint, "
                          f"about {self.top_z_m * 100:.0f} cm tall")
@@ -187,7 +183,20 @@ class Scene:
         o.held = False
 
     def describe(self) -> str:
-        lines = [o.describe() for o in self.objects.values()] + [h.describe() for h in self.hands.values()]
+        """The numbered scene list, objects ordered closest to the robot first, with the comparisons a
+        small model gets wrong (closest, furthest, tallest) worked out here."""
+        objs = sorted(self.objects.values(), key=lambda o: float(np.hypot(*o.center_m[:2])))
+        on_table = [o for o in objs if not o.held]
+        notes: dict[int, list[str]] = {o.id: [] for o in objs}
+        if len(on_table) > 1:
+            notes[on_table[0].id].append("CLOSEST to the robot")
+            notes[on_table[-1].id].append("FURTHEST from the robot")
+            tallest = max(on_table, key=lambda o: o.top_z_m)
+            notes[tallest.id].append("TALLEST")
+        lines = [o.describe() + "".join(f", {n}" for n in notes[o.id]) for o in objs]
+        if lines:
+            lines.insert(0, "Objects, closest to the robot first:")
+        lines += [h.describe() for h in self.hands.values()]
         return "\n".join(lines) if lines else "(nothing seen yet)"
 
     def _projects_into(self, o: SceneObject, est: ObjectEstimate, grow_px: int = 12) -> bool:

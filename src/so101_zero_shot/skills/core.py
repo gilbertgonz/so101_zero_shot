@@ -52,19 +52,14 @@ OPEN_PCT = 100.0  # = the user's max safe opening (gripper calibration range_min
 DESCEND_SPEED = 15.0
 DOWN = np.array([0.0, 0.0, -1.0])
 APPROACHES = ("down", "forward", "auto")
-# touch(): creep toward the target in steps this long, at this speed, and call it contact when a joint
-# lags its command by this much or a load (0.1 % of max torque) rises this far above the free-space value.
-# Measured in the MuJoCo sim; to be measured on the real arm like the gripper.
-TOUCH_STEP_M = 0.004
-TOUCH_SPEED = 8.0
-TOUCH_LAG_DEG = 1.5
-TOUCH_LOAD_RISE = 150.0
 # look(): base turn for a photo taken where the camera already was (~3 cm of camera travel at the scan pose)
 NUDGE_PAN_DEG = 10.0
 TRANSIT_Z_M = 0.13  # fingertips this high when travelling between spots (a held object hangs ~3-8 cm below)
-TOUCH_STANDOFF_M = 0.04
-TOUCH_REF_STEPS = 3  # 12 mm of free-air creep before the target can be reached
-TOUCH_AXIS_TOL_DEG = 30.0  # 5 joints: straight down / straight forward are only reachable in parts of the workspace
+# move_path(): straight lines in steps this long; the fingertips stay this high; a step that needs a bigger
+# joint change than this is a wrist flip (the 5-joint arm switching between reaching down and forward).
+PATH_STEP_M = 0.015
+PATH_MIN_Z_M = 0.01
+PATH_MAX_JUMP_DEG = 25.0
 
 
 class SkillFailed(Exception):
@@ -165,8 +160,10 @@ class Skills:
         return self.cfg.poses["scan"]
 
     # ------------------------------------------------------------------ motion primitives
-    def move_joints(self, q: np.ndarray, gripper: float | None = None, speed: float | None = None,
-                    settle_timeout_s: float = 3.0, compensate: bool = True) -> None:
+    def _drive(self, q: np.ndarray, gripper: float | None = None, speed: float | None = None,
+               settle_timeout_s: float = 3.0, compensate: bool = True) -> None:
+        """Send the arm to joint target `q` and wait for it (every motion below ends here). Camera frames
+        from an earlier move no longer match where the arm is, so they are dropped."""
         self._move_frames = []
         self.arm.move_to(q, gripper=gripper, speed_deg_s=speed or self.speed, settle_timeout_s=settle_timeout_s,
                          compensate=compensate)
@@ -183,20 +180,20 @@ class Skills:
         return self.cam_model.pose_in_base(self.kin, q)[:3, 3]
 
     def move_collecting(self, q: np.ndarray) -> None:
-        """move_joints, keeping camera frames from the way (with their joints): the other views a photo
+        """Move to `q`, keeping camera frames from the way (with their joints): the other views a photo
         taken at `q` is measured with (look)."""
         ls = self.look_settings
         with MotionFrames(self.arm, self.camera, self._camera_center, min_step_m=ls.min_step_m,
                           camera_latency_s=ls.camera_latency_s) as mf:
-            self.move_joints(q)
+            self._drive(q)
         self._move_frames = mf.frames()
 
     def return_home(self, via_scan: bool) -> None:
         """Back to rest at <= 30 deg/s, first up through the scan pose if the arm may be low or tangled."""
         speed = min(self.speed, 30.0)
         if via_scan:
-            self.move_joints(self.scan, speed=speed)
-        self.move_joints(self.rest, speed=speed)
+            self._drive(self.scan, speed=speed)
+        self._drive(self.rest, speed=speed)
 
     def tip(self) -> np.ndarray:
         return self.kin.fk(self.arm.read_joints())[:3, 3]
@@ -205,7 +202,7 @@ class Skills:
     def photo(self, q_cmd: np.ndarray | None, tag: str) -> tuple[np.ndarray, np.ndarray]:
         """Move to `q_cmd` (if given), let exposure settle, take a fresh photo. Returns (fisheye BGR, joints)."""
         if q_cmd is not None:
-            self.move_joints(q_cmd)
+            self._drive(q_cmd)
             time.sleep(1.0)  # auto exposure settles after the move
         img = self.camera.read_fresh(0.3)
         q = self.arm.read_joints()
@@ -373,11 +370,11 @@ class Skills:
     # ------------------------------------------------------------------ grasp motions
     def pregrasp(self, plan: GraspPlan) -> None:
         """Open the gripper on the way to the pose above the object."""
-        self.move_joints(plan.pregrasp_deg, gripper=OPEN_PCT)
+        self._drive(plan.pregrasp_deg, gripper=OPEN_PCT)
 
     def descend(self, plan: GraspPlan) -> np.ndarray:
         """Slowly down to the grasp pose. Returns the measured fingertip point."""
-        self.move_joints(plan.grasp_deg, speed=DESCEND_SPEED)
+        self._drive(plan.grasp_deg, speed=DESCEND_SPEED)
         return self.tip()
 
     def close(self) -> Grip:
@@ -386,14 +383,14 @@ class Skills:
 
     def lift(self, plan: GraspPlan) -> Grip:
         """Up to the lift pose; the returned grip says whether something is held."""
-        self.move_joints(plan.lift_deg, speed=DESCEND_SPEED)
+        self._drive(plan.lift_deg, speed=DESCEND_SPEED)
         return Grip(*read_grip(self.arm))
 
     def place_back(self, plan: GraspPlan) -> None:
         """Put the held object back where it was picked, open, back off, close."""
-        self.move_joints(plan.grasp_deg, speed=DESCEND_SPEED)
+        self._drive(plan.grasp_deg, speed=DESCEND_SPEED)
         self.arm.set_gripper(OPEN_PCT, duration_s=0.8)
-        self.move_joints(plan.lift_deg, speed=DESCEND_SPEED)
+        self._drive(plan.lift_deg, speed=DESCEND_SPEED)
         self.arm.set_gripper(0.0, duration_s=0.6)
         self.held = None
 
@@ -453,13 +450,13 @@ class Skills:
             over = self._transit_q(tip_goal[:2], up if up is not None else here)
             for q in (up, over):
                 if q is not None and path_is_safe(self.kin, self.planner.cc, self.arm.read_joints(), q, 0.0):
-                    self.move_joints(q)
+                    self._drive(q)
         if not path_is_safe(self.kin, self.planner.cc, self.arm.read_joints(), q_goal, 0.0):
             # Straight joint-space path dips: go up through the scan pose first.
             if not path_is_safe(self.kin, self.planner.cc, self.scan, q_goal, 0.0):
                 raise SkillFailed("no safe path there")
-            self.move_joints(self.scan)
-        self.move_joints(q_goal, gripper=gripper, speed=speed)
+            self._drive(self.scan)
+        self._drive(q_goal, gripper=gripper, speed=speed)
 
     def move_to(self, point_m: np.ndarray, approach: str = "auto", speed: float | None = None,
                 gripper: float | None = None, axis_tol_deg: float = 15.0) -> str:
@@ -481,85 +478,73 @@ class Skills:
         except (ValueError, GraspPlanningError) as e:
             raise SkillFailed(f"cannot place there: {e}") from e
         self.travel_to(plan.pregrasp_deg)
-        self.move_joints(plan.grasp_deg, speed=DESCEND_SPEED)
+        self._drive(plan.grasp_deg, speed=DESCEND_SPEED)
         self.arm.set_gripper(OPEN_PCT, duration_s=0.8)
-        self.move_joints(plan.lift_deg, speed=DESCEND_SPEED)
+        self._drive(plan.lift_deg, speed=DESCEND_SPEED)
         self.arm.set_gripper(0.0, duration_s=0.6)
         self.held = None
         return np.array([xy_m[0], xy_m[1], h.top_z_m])
 
-    def release_above(self, point_m: np.ndarray, height_m: float = 0.06) -> None:
-        """Hold the object `height_m` above `point_m` (e.g. a hand) and let go."""
-        if self.held is None:
-            raise SkillFailed("not holding anything")
-        self.move_to(np.asarray(point_m, dtype=float) + [0, 0, height_m], approach="auto")
-        self.arm.set_gripper(OPEN_PCT, duration_s=0.8)
-        time.sleep(0.5)
-        self.arm.set_gripper(0.0, duration_s=0.6)
-        self.held = None
-
-    def _steady_state(self, n: int = 3) -> tuple[np.ndarray, np.ndarray]:
-        """Median (position, load) over a few reads after a short pause: right after a move the load
-        reading is dominated by the motion itself (measured in sim: free-air spikes of +150 to +300)."""
-        time.sleep(0.15)
-        reads = [self.arm.read_state(num_retry=2) for _ in range(n)]
-        return np.median([r[0] for r in reads], axis=0), np.median([r[1] for r in reads], axis=0)
-
-    def touch(self, point_m: np.ndarray, approach: str = "auto", max_push_m: float = 0.03) -> dict:
-        """Touch `point_m` gently with the closed gripper: line up TOUCH_STANDOFF_M before it, creep along the
-        approach in small slow steps, stop at the first sign of contact or `max_push_m` past the point, then
-        back off to the standoff. Contact = a joint lagging its command, or a joint load, more than the
-        free-space creep did (the first TOUCH_REF_STEPS steps are in free air and set the reference).
-        Returns {"contact", "tip_m" (where it stopped), "travel_m" (past the point; < 0 = before it),
-        "approach", "signal", "trace" (per step: lag deg, load rise)}."""
-        point_m = np.asarray(point_m, dtype=float)
-        self.arm.set_gripper(0.0, duration_s=0.4)
-        if approach == "auto":
-            # Prefer coming from the robot's side for something standing up (a hand), from above otherwise.
-            tries = ["forward", "down"] if point_m[2] > 0.06 else ["down", "forward"]
-        else:
-            tries = [approach]
-        reasons = []
-        for a in tries:
-            axis = self._approach_axis(point_m, a)
+    def _solve_near(self, point_m: np.ndarray, q_prev: np.ndarray) -> tuple[np.ndarray, str]:
+        """Like solve(), but of the valid solutions (down, forward, any angle) the one closest to q_prev, so a
+        path keeps its hand orientation instead of switching approach at every step."""
+        found, reasons = [], []
+        for a in ("down", "forward", "tilted"):
+            if a == "tilted":
+                res = self.kin.ik(point_m, q_prev, approach_axis=None)
+                ok = res.success and min_link_height(self.kin, res.joints_deg) >= 0.0 \
+                    and not self.planner.cc.in_collision(res.joints_deg)
+                if ok:
+                    found.append((res.joints_deg, a))
+                continue
             try:
-                q_stand, _ = self.solve(point_m - TOUCH_STANDOFF_M * axis, a, axis_tol_deg=TOUCH_AXIS_TOL_DEG)
-                break
+                found.append(self.solve(point_m, a, from_q=q_prev))
             except SkillFailed as e:
                 reasons.append(str(e))
-        else:
-            raise SkillFailed(f"cannot line up to touch it: {'; '.join(reasons)}")
-        self.travel_to(q_stand)
-        total = TOUCH_STANDOFF_M + max_push_m
-        n = int(np.ceil(total / TOUCH_STEP_M))
-        q, signal, travel = q_stand, None, 0.0
-        trace: list[tuple[float, float]] = []
-        ref_lag, ref_load = None, None
-        for i in range(1, n + 1):
-            d = min(i * TOUCH_STEP_M, total)
-            res = self.kin.ik(point_m + (d - TOUCH_STANDOFF_M) * axis, q, approach_axis=axis,
-                              axis_tol_deg=TOUCH_AXIS_TOL_DEG)
-            if not res.success:
-                signal = "out of reach"
-                break
-            q = res.joints_deg
-            self.arm.move_to(q, speed_deg_s=TOUCH_SPEED, settle_timeout_s=0.4, compensate=False)
-            pos, load = self._steady_state()
-            lag = np.abs(q - pos[:5])
-            travel = d
-            if i <= TOUCH_REF_STEPS:  # free air: how much lag/load plain creeping causes here
-                ref_lag = lag if ref_lag is None else np.maximum(ref_lag, lag)
-                ref_load = load[:5] if ref_load is None else ref_load
-                trace.append((round(float(lag.max()), 2), 0.0))
-                continue
-            lag_rise = float(np.max(lag - ref_lag))
-            load_rise = float(np.max(np.abs(load[:5] - ref_load)))
-            trace.append((round(lag_rise, 2), round(load_rise, 1)))
-            if lag_rise > TOUCH_LAG_DEG or load_rise > TOUCH_LOAD_RISE:
-                signal = f"lag +{lag_rise:.1f} deg, load +{load_rise:.0f}"
-                break
-        tip = self.tip()
-        contact = signal is not None and signal != "out of reach"
-        self.arm.move_to(q_stand, speed_deg_s=TOUCH_SPEED * 2, settle_timeout_s=1.0, compensate=False)
-        return {"contact": contact, "tip_m": tip, "travel_m": travel - TOUCH_STANDOFF_M, "approach": a,
-                "signal": signal or "nothing felt", "trace": trace}
+        if not found:
+            raise SkillFailed(reasons[0] if reasons else f"cannot reach {np.round(point_m * 100, 1)} cm")
+        return min(found, key=lambda qa: float(np.max(np.abs(qa[0] - q_prev))))
+
+    def move_path(self, points_m, gripper: str | None = None) -> list[str]:
+        """Fingertips through `points_m` (base frame) in order: to the first by the usual high travel
+        (travel_to), then in straight lines from point to point, in PATH_STEP_M steps. The whole path is
+        solved and checked (table, self-collision, soft limits, no sudden wrist flips) before anything
+        moves; a SkillFailed says which point is the problem. gripper: "open" / "close" after the last point
+        (opening while holding lets go of the object). Returns the approach used at each point."""
+        pts = [np.asarray(p, dtype=float) for p in points_m]
+        if not pts:
+            raise SkillFailed("no points to move through")
+        for i, p in enumerate(pts, 1):
+            if p.shape != (3,) or not np.all(np.isfinite(p)):
+                raise SkillFailed(f"point {i} must be three numbers (x, y, z)")
+            if p[2] < PATH_MIN_Z_M:
+                raise SkillFailed(f"point {i} is {p[2] * 100:.1f} cm high; the fingertips must stay at least "
+                                  f"{PATH_MIN_Z_M * 100:.0f} cm above the table")
+        if gripper not in (None, "open", "close"):
+            raise SkillFailed('gripper must be "open", "close" or left out')
+        q_first, a = self.solve(pts[0], "auto")
+        q_prev, used, steps = q_first, [a], []
+        for i in range(1, len(pts)):
+            seg = pts[i] - pts[i - 1]
+            n = max(1, int(np.ceil(np.linalg.norm(seg) / PATH_STEP_M)))
+            for k in range(1, n + 1):
+                p = pts[i - 1] + seg * (k / n)
+                try:
+                    q, a = self._solve_near(p, q_prev)
+                except SkillFailed as e:
+                    raise SkillFailed(f"on the way to point {i + 1}: {e}") from None
+                if np.max(np.abs(q - q_prev)) > PATH_MAX_JUMP_DEG:
+                    raise SkillFailed(f"on the way to point {i + 1} the arm would have to flip its wrist "
+                                      f"(near {np.round(p * 100, 1)} cm); use other points")
+                steps.append(q)
+                q_prev = q
+            used.append(a)
+        self.travel_to(q_first)
+        for q in steps:
+            self._drive(q, settle_timeout_s=1.0)
+        if gripper == "open":
+            self.arm.set_gripper(OPEN_PCT, duration_s=0.8)
+            self.held = None
+        elif gripper == "close":
+            self.arm.set_gripper(0.0, duration_s=0.6)
+        return used

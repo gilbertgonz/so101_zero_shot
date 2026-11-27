@@ -1,7 +1,11 @@
-"""Agent benchmark in the MuJoCo sim: 10 requests, scored from the sim's true object positions.
+"""Agent benchmark in the MuJoCo sim: 5 hard requests, each run 3 times on a shifted scene, scored from the
+sim's true object positions.
 
-Each task resets the sim scene (optionally moving an object or holding up a hand), runs the agent with
-everything approved automatically, and scores the result:
+The tasks need more than a direct instruction: choosing an object by what it is for, a motion no tool
+names (knocking something over, with move_gripper), placing between two objects, a multi-step task that
+needs a search first, and admitting an object is not there. Each run
+resets the sim scene (objects shifted up to 2 cm and turned, the same shifts for every reasoner), runs the
+agent with everything approved automatically, and scores the result:
   success  the request was done (or correctly refused) and nothing else was knocked around
   partial  a reasonable attempt: the right object was picked up but the goal was not met, or a correct
            refusal / goal that moved other objects on the way
@@ -11,16 +15,17 @@ Only the reasoning model changes between runs (--reasoner); perception, tools, s
 the same, so the table compares reasoners.
 
 Usage:
-  benchmark.py                                   all tasks with the configured reasoner
+  benchmark.py                                   all tasks, 3 times each, with the configured reasoner
   benchmark.py --reasoner hf:Qwen/Qwen3-VL-8B-Instruct@4bit
-  benchmark.py --tasks pick_cube,high_five       only these
-  benchmark.py --repeats 3 --jitter 0.02         each task 3 times, objects shifted up to 2 cm and turned
+  benchmark.py --tasks write,knock           only these
+  benchmark.py --repeats 1 --jitter 0            one quick run on the unshifted scene
   benchmark.py --no-video                        skip the videos (by default: one per task + a mosaic of all)
   benchmark.py --mosaic runs/sim/benchmark_X     rebuild the mosaic of an earlier run
   benchmark.py --list
 
-Results go to runs/sim/benchmark_<time>/: results.jsonl, summary.md, each task's agent run, videos/<task>.mp4
-(3/4 view + wrist camera, 4x speed) and mosaic.mp4 (all tasks side by side, tiles coloured by score).
+Results go to runs/sim/benchmark_<time>/: results.jsonl, summary.md, each task's agent run,
+videos/<task>_<repeat>.mp4 (3/4 view + wrist camera, 4x speed) and mosaic.mp4 (one column per task, one row
+per repeat, tiles coloured by score).
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ from so101_zero_shot.skills import new_run_dir
 LIFT_M = 0.03  # an object counts as picked up when it rose this far
 MOVED_M = 0.02  # ... and as moved when its centre shifted this far on the table
 ON_TABLE_M = 0.015  # set down = its centre ends within this of its starting height
+TIPPED_M = 0.01  # knocked over = its centre ended this much lower (the 7 cm cylinder lying: 1.9 cm lower)
 
 
 # ------------------------------------------------------------------ scoring
@@ -75,18 +81,24 @@ class Outcome:
 Score = tuple[str, str]  # (success | partial | fail, why)
 
 
-def score_pick(target: str) -> Callable[[Outcome], Score]:
+def score_pick(target: str | Callable[[Outcome], str]) -> Callable[[Outcome], Score]:
+    """target: an object name, or a function choosing it from the outcome (e.g. the closest at the start)."""
     def score(o: Outcome) -> Score:
-        if not o.lifted(target):
-            wrong = [n for n in o.start if o.lifted(n)]
-            return "fail", f"{target} not lifted" + (f" (lifted {', '.join(wrong)})" if wrong else "")
-        other = o.disturbed({target})
-        if o.status != "done":
-            return "partial", f"{target} lifted but the run ended {o.status!r}"
-        if other:
-            return "partial", f"{target} lifted; also disturbed {', '.join(other)}"
-        return "success", f"{target} lifted"
+        target_ = target(o) if callable(target) else target
+        return _score_pick(o, target_)
     return score
+
+
+def _score_pick(o: Outcome, target: str) -> Score:
+    if not o.lifted(target):
+        wrong = [n for n in o.start if o.lifted(n)]
+        return "fail", f"{target} not lifted" + (f" (lifted {', '.join(wrong)})" if wrong else "")
+    other = o.disturbed({target})
+    if o.status != "done":
+        return "partial", f"{target} lifted but the run ended {o.status!r}"
+    if other:
+        return "partial", f"{target} lifted; also disturbed {', '.join(other)}"
+    return "success", f"{target} lifted"
 
 
 def score_place(obj: str, goal: Callable[[Outcome], tuple[bool, str]]) -> Callable[[Outcome], Score]:
@@ -112,13 +124,15 @@ def next_to(obj: str, ref: str, max_gap_m: float = 0.09) -> Callable[[Outcome], 
     return goal
 
 
-def toward_robot(obj: str, want_m: float = 0.05, tol_m: float = 0.025) -> Callable[[Outcome], tuple[bool, str]]:
+def between(obj: str, a: str, b: str, max_off_m: float = 0.03) -> Callable[[Outcome], tuple[bool, str]]:
+    """obj ends on the segment from a to b: within max_off_m of it, and in its middle 60%."""
     def goal(o: Outcome) -> tuple[bool, str]:
-        start, end = o.start[obj][:2], o.end[obj][:2]
-        closer = float(np.linalg.norm(start) - np.linalg.norm(end))
-        sideways = float(np.linalg.norm(end - start * (np.linalg.norm(end) / max(np.linalg.norm(start), 1e-6))))
-        ok = abs(closer - want_m) <= tol_m and sideways <= 0.03
-        return ok, f"{closer * 100:.1f} cm closer, {sideways * 100:.1f} cm sideways (want {want_m * 100:.0f} closer)"
+        pa, pb, p = o.end[a][:2], o.end[b][:2], o.end[obj][:2]
+        ab = pb - pa
+        t = float(np.dot(p - pa, ab) / max(np.dot(ab, ab), 1e-9))
+        off = float(np.linalg.norm(p - (pa + np.clip(t, 0, 1) * ab)))
+        ok = 0.2 <= t <= 0.8 and off <= max_off_m
+        return ok, f"{off * 100:.1f} cm off the line from {a} to {b}, {100 * t:.0f}% of the way (want 20-80%)"
     return goal
 
 
@@ -146,6 +160,23 @@ def score_place_all(objs: list[str], goal: Callable[[Outcome, str], tuple[bool, 
     return score
 
 
+def score_knocked_over(obj: str) -> Callable[[Outcome], Score]:
+    """obj ends lying on its side (its centre dropped), pushed over rather than picked up and dropped."""
+    def score(o: Outcome) -> Score:
+        drop = float(o.start[obj][2] - o.end[obj][2])
+        down = drop >= TIPPED_M
+        other = o.disturbed({obj})
+        if not down:
+            return "fail", f"{obj} still standing ({drop * 100:.1f} cm lower)"
+        if o.lifted(obj):
+            return "partial", f"{obj} lying down, but it was picked up and dropped, not knocked over"
+        if other or o.status != "done":
+            return "partial", f"{obj} knocked over; " + (f"also disturbed {', '.join(other)}" if other
+                                                       else f"ended {o.status!r}")
+        return "success", f"{obj} knocked over"
+    return score
+
+
 def score_refusal(o: Outcome) -> Score:
     moved = o.disturbed(set())
     if o.status not in ("refused", "failed"):
@@ -165,25 +196,25 @@ class Task:
     setup: Callable[[object], None] = field(default=lambda world: None)
 
 
+# "Next to" as centre distance: about a 5 cm gap or less. The 13 cm marker's centre cannot get as close.
+NEXT_TO_M = {"red_cube": 0.10, "marker": 0.13}
+
+
 def _marker_off_to_the_left(world) -> None:
     world.set_object("marker", [0.16, 0.18, 0.009], yaw_deg=40.0)
 
 
 TASKS = [
-    Task("pick_cube", "pick up the red cube", "basic pick", score_pick("red_cube")),
-    Task("closest", "pick up the object closest to the robot", "spatial reasoning", score_pick("yellow_ball")),
-    Task("write", "pick up something to write with", "meaning to object", score_pick("marker")),
-    Task("tallest", "pick up the tallest object", "size reasoning", score_pick("blue_can")),
-    Task("next_to", "put the red cube next to the blue can", "pick and place",
-         score_place("red_cube", next_to("red_cube", "blue_can"))),
-    Task("closer", "move the blue can about 5 cm closer to the robot", "placing at a measured spot",
-         score_place("blue_can", toward_robot("blue_can"))),
-    Task("search", "pick up the marker", "searching (marker moved off to the left)", score_pick("marker"),
+    Task("write", "pick up something I can write with", "choosing an object by what it is for", score_pick("marker")),
+    Task("knock", "knock over the blue cylinder", "a motion no tool names (the gripper has to push it over)",
+         score_knocked_over("blue_cylinder")),
+    Task("between", "put the yellow ball between the red cube and the blue cylinder", "placing relative to two objects",
+         score_place("yellow_ball", between("yellow_ball", "red_cube", "blue_cylinder"))),
+    Task("tidy", "put the marker and the red cube next to the blue cylinder", "multi-step after a search (the marker "
+         "starts far off to the left)",
+         score_place_all(["marker", "red_cube"], lambda o, obj: next_to(obj, "blue_cylinder", NEXT_TO_M[obj])(o)),
          _marker_off_to_the_left),
-    Task("two_steps", "put the red cube and the yellow ball next to the blue can", "multi-step (two pick and places)",
-         score_place_all(["red_cube", "yellow_ball"], lambda o, obj: next_to(obj, "blue_can", 0.10)(o))),
-    Task("coffee", "make me a cup of coffee", "refusing the impossible", score_refusal),
-    Task("missing", "pick up the purple bottle", "object not there", score_refusal),
+    Task("missing", "pick up the purple bottle", "saying an object is not there", score_refusal),
 ]
 
 
@@ -267,10 +298,19 @@ POINTS = {"success": 1.0, "partial": 0.5, "fail": 0.0}
 
 
 def summary(rows: list[dict], reasoner: str) -> str:
-    lines = [f"# Agent benchmark: {reasoner}", "",
-             "| task | request | score | why | time s | calls |", "|---|---|---|---|---|---|"]
+    lines = [f"# Agent benchmark: {reasoner}", "", "## Per task (average over repeats)", "",
+             "| task | request | runs | success | partial | fail | score | median s |", "|---|---|---|---|---|---|---|---|"]
+    for task in dict.fromkeys(r["task"] for r in rows):
+        rs = [r for r in rows if r["task"] == task]
+        c = {k: sum(r["score"] == k for r in rs) for k in POINTS}
+        pts = sum(POINTS[r["score"]] for r in rs)
+        lines.append(f"| {task} | {rs[0]['request']} | {len(rs)} | {c['success']} | {c['partial']} | {c['fail']} | "
+                     f"{pts / len(rs):.2f} | {np.median([r['seconds'] for r in rs]):.0f} |")
+    lines += ["", "## Every run", "", "| task | repeat | score | why | result | time s | calls |",
+              "|---|---|---|---|---|---|---|"]
     for r in rows:
-        lines.append(f"| {r['task']} | {r['request']} | {r['score']} | {r['why']} | {r['seconds']} | {r['tool_calls']} |")
+        lines.append(f"| {r['task']} | {r.get('repeat', 0)} | {r['score']} | {r['why']} | {r['result'][:80]} | "
+                     f"{r['seconds']} | {r['tool_calls']} |")
     n = len(rows)
     counts = {k: sum(r["score"] == k for r in rows) for k in POINTS}
     pts = sum(POINTS[r["score"]] for r in rows)
@@ -283,9 +323,10 @@ def summary(rows: list[dict], reasoner: str) -> str:
 SCORE_COLORS = {"success": (60, 180, 60), "partial": (0, 170, 230), "fail": (50, 50, 220)}  # BGR
 
 
-def make_mosaic(rows: list[dict], path: Path, tile: tuple[int, int] = (480, 360), cols: int = 5) -> Path | None:
-    """All task videos side by side in one grid video, each tile labelled with its task and score. Clips
-    run together; a finished one holds its last frame until the longest ends."""
+def make_mosaic(rows: list[dict], path: Path, tile: tuple[int, int] = (480, 360)) -> Path | None:
+    """All task videos side by side in one grid video (a column per task, a row per repeat), each tile
+    labelled with its task and score. Clips run together; a finished one holds its last frame until the
+    longest ends."""
     import cv2
 
     from so101_zero_shot.mujoco_sim import encode_h264
@@ -296,8 +337,10 @@ def make_mosaic(rows: list[dict], path: Path, tile: tuple[int, int] = (480, 360)
         return None
     fps = clips[0][1].get(cv2.CAP_PROP_FPS) or 40.0
     tw, th = tile
-    cols = min(cols, len(clips))
-    rows_n = -(-len(clips) // cols)
+    tasks = list(dict.fromkeys(r["task"] for r, _ in clips))
+    repeats = sorted({r.get("repeat", 0) for r, _ in clips})
+    cols, rows_n = len(tasks), len(repeats)
+    cells = [(repeats.index(r.get("repeat", 0)), tasks.index(r["task"])) for r, _ in clips]
     raw = path.with_suffix(".raw.mp4")
     writer = cv2.VideoWriter(str(raw), cv2.VideoWriter_fourcc(*"mp4v"), fps, (cols * tw, rows_n * th))
     last: list = [None] * len(clips)
@@ -318,10 +361,10 @@ def make_mosaic(rows: list[dict], path: Path, tile: tuple[int, int] = (480, 360)
                 color = SCORE_COLORS.get(r["score"], (128, 128, 128))
                 cv2.rectangle(img, (0, 0), (tw - 1, th - 1), color, 4)
                 cv2.rectangle(img, (0, th - 52), (tw, th), (0, 0, 0), -1)
-                cv2.putText(img, f"{r['task']}: {r['score'].upper()}", (8, th - 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                cv2.putText(img, f"{r['task']} #{r.get('repeat', 0) + 1}: {r['score'].upper()}", (8, th - 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                             color, 2)
                 cv2.putText(img, r["request"][:52], (8, th - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-                y, x = divmod(i, cols)
+                y, x = cells[i]
                 canvas[y * th:(y + 1) * th, x * tw:(x + 1) * tw] = img
             if any(live):
                 writer.write(canvas)
@@ -340,8 +383,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--reasoner", default=None, help="backend:model[@options] (default: config agent.reasoner)")
     ap.add_argument("--tasks", default="", help="comma-separated task ids (default: all)")
-    ap.add_argument("--repeats", type=int, default=1)
-    ap.add_argument("--jitter", type=float, default=0.0, help="shift objects up to this many m (and turn them)")
+    ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--jitter", type=float, default=0.02,
+                    help="shift objects up to this many m and turn them (repeat i uses seed i)")
+    ap.add_argument("--seeds", default="", help="comma-separated repeat numbers to run instead of 0..repeats-1, "
+                    "e.g. 1 to redo only the second scene")
     ap.add_argument("--max-steps", type=int, default=AgentConfig.max_steps)
     ap.add_argument("--no-video", action="store_true", help="do not save task videos and the mosaic")
     ap.add_argument("--mosaic", type=Path, default=None, metavar="DIR",
@@ -377,13 +423,14 @@ def main() -> None:
     print(f"reasoner: {reasoner.name}\nresults: {out}\n")
     rows: list[dict] = []
     try:
-        for rep in range(args.repeats):
+        reps = [int(x) for x in args.seeds.split(",") if x.strip()] or list(range(args.repeats))
+        for rep in reps:
             for t in tasks:
                 seed = rep if args.jitter > 0 else None
                 print(f"[{t.id}] {t.request}" + (f" (seed {seed})" if seed is not None else ""))
-                row = {"reasoner": reasoner.name, **run_task(
+                row = {"reasoner": reasoner.name, "repeat": rep, **run_task(
                     t, agent, world, parts["cfg"], seed, args.jitter,
-                    out / "videos" / f"{t.id}{'' if args.repeats == 1 else f'_{rep}'}.mp4" if not args.no_video else None)}
+                    out / "videos" / f"{t.id}_{rep}.mp4" if not args.no_video else None)}
                 rows.append(row)
                 print(f"  -> {row['score'].upper()}: {row['why']} ({row['result']}; {row['seconds']} s)\n")
                 with (out / "results.jsonl").open("a") as f:

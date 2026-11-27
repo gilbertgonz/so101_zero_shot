@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 
 SIM_SCENE_PATH = ASSETS_DIR / "sim_scene.xml"
 STOP_MARGIN_DEG = 4.0  # soft limits are the calibrated range minus this; the sim joint range is the full range
+OBJECT_GAP_M = 0.005  # shifted objects (reset with jitter) keep at least this much space between them
 _ARM_CONTYPE, _WORLD_CONTYPE = 2, 1  # arm geoms collide with the world (table, objects), not each other
 # MuJoCo collides meshes as their convex hulls; a clamp's hull is a solid 5 x 7 x 9 cm block that stops the
 # jaws ~4 mm early on each side. Each clamp's collision is replaced by a box over its finger: the last 35 mm
@@ -80,6 +81,11 @@ class SimWorld:
         self._filter_collisions()
         self._objects = [m.body(i).name for i in range(m.nbody)
                          if m.body_jntnum[i] == 1 and m.jnt_type[m.body_jntadr[i]] == mujoco.mjtJoint.mjJNT_FREE]
+        # Top-view radius of each object (largest over its geoms' boxes), for keeping shifted objects apart.
+        self._radius_xy = np.array([max(float(np.linalg.norm(np.abs(m.geom_pos[g][:2]) + np.abs(m.geom_aabb[g][:2])) +
+                                              np.linalg.norm(m.geom_aabb[g][3:5]))
+                                        for g in range(m.ngeom) if m.geom_bodyid[g] == m.body(n).id)
+                                    for n in self._objects])
         self._hand_body = m.body("hand").id if "hand" in {m.body(i).name for i in range(m.nbody)} else None
         self._hand_mocap = int(m.body_mocapid[self._hand_body]) if self._hand_body is not None else None
         self._hand_park = m.body_pos[self._hand_body].copy() if self._hand_body is not None else None
@@ -167,15 +173,21 @@ class SimWorld:
         with self._lock:
             mujoco.mj_resetData(self.model, self.data)
             self.data.qpos[:] = self._home
-            for name in self._objects:
-                adr = int(self.model.jnt_qposadr[self.model.body(name).jntadr[0]])
-                if jitter_m > 0:
-                    self.data.qpos[adr:adr + 2] += rng.uniform(-jitter_m, jitter_m, 2)
-                    yaw = rng.uniform(-np.pi, np.pi)
-                    q = np.empty(4)
-                    mujoco.mju_mulQuat(q, np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]),
-                                       self.data.qpos[adr + 3:adr + 7].copy())
-                    self.data.qpos[adr + 3:adr + 7] = q
+            adrs = [int(self.model.jnt_qposadr[self.model.body(n).jntadr[0]]) for n in self._objects]
+            for _ in range(100):  # redraw shifts that make objects overlap (physics would throw them apart)
+                self.data.qpos[:] = self._home
+                for adr in adrs:
+                    if jitter_m > 0:
+                        self.data.qpos[adr:adr + 2] += rng.uniform(-jitter_m, jitter_m, 2)
+                        yaw = rng.uniform(-np.pi, np.pi)
+                        q = np.empty(4)
+                        mujoco.mju_mulQuat(q, np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]),
+                                           self.data.qpos[adr + 3:adr + 7].copy())
+                        self.data.qpos[adr + 3:adr + 7] = q
+                xy = np.array([self.data.qpos[a:a + 2] for a in adrs])
+                gap = np.linalg.norm(xy[:, None] - xy[None], axis=-1) - self._radius_xy[:, None] - self._radius_xy[None]
+                if jitter_m <= 0 or (gap + np.eye(len(adrs)) * 1.0).min() >= OBJECT_GAP_M:
+                    break
             for j, q in zip(ARM_JOINTS, self.cfg.poses["rest"]):
                 self.data.qpos[self._qadr[j]] = np.radians(q)
                 self.data.ctrl[self._aid[j]] = np.radians(q)
@@ -189,32 +201,20 @@ class SimWorld:
             self.reset_tracking()
 
     # ------------------------------------------------------------------ props and ground truth
-    HAND_POSES = {
-        # palm down, fingers pointing away from the robot (+x): a hand lying on / hovering over the table
-        "palm_down": np.eye(3),
-        # palm facing the robot, fingers up: offering a high five
-        "high_five": np.array([[0.0, 0.0, 1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0]]),
-    }
-
-    # Ready-made hand placements (palm centre m, pose, yaw deg) for scripts/agent.py and the benchmark.
+    # Ready-made hand placement (palm centre m, yaw deg) for scripts/agent.py --hand-down.
     HAND_PLACEMENTS = {
-        "five": ([0.34, 0.0, 0.10], "high_five", 0.0),  # held up in front of the robot for a high five
-        "down": ([0.24, 0.08, 0.035], "palm_down", 150.0),  # lying palm down on the table
+        "down": ([0.24, 0.08, 0.035], 150.0),  # lying palm down on the table
     }
 
-    def set_hand(self, pos_m, pose: str = "palm_down", yaw_deg: float = 0.0) -> None:
-        """Put the hand prop at `pos_m` (palm centre, base frame) in a named pose, turned by yaw_deg about z."""
+    def set_hand(self, pos_m, yaw_deg: float = 0.0) -> None:
+        """Put the hand prop palm down at `pos_m` (palm centre, base frame; fingers along +x), turned by
+        yaw_deg about z."""
         if self._hand_mocap is None:
             raise RuntimeError("this scene has no hand prop")
-        if pose not in self.HAND_POSES:
-            raise ValueError(f"pose must be one of {list(self.HAND_POSES)}")
-        c, s_ = np.cos(np.radians(yaw_deg)), np.sin(np.radians(yaw_deg))
-        R = np.array([[c, -s_, 0], [s_, c, 0], [0, 0, 1.0]]) @ self.HAND_POSES[pose]
-        q = np.empty(4)
-        mujoco.mju_mat2Quat(q, R.reshape(-1))
+        h = np.radians(yaw_deg) / 2.0
         with self._lock:
             self.data.mocap_pos[self._hand_mocap] = np.asarray(pos_m, dtype=float)
-            self.data.mocap_quat[self._hand_mocap] = q
+            self.data.mocap_quat[self._hand_mocap] = (np.cos(h), 0.0, 0.0, np.sin(h))
             mujoco.mj_forward(self.model, self.data)
 
     def hide_hand(self) -> None:

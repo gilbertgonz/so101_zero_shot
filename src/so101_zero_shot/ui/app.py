@@ -1,8 +1,11 @@
-"""Local web UI: live wrist camera, live arm view, prompt, step-by-step plan panel, approvals, stop.
+"""Local web UI: live wrist camera, live arm view, a request box, step-by-step panel, approvals, stop.
+
+Requests go to the agent (any task: it looks, plans, asks for approval and runs tools); the direct grasp
+pipeline (a named object, or one clicked in the camera view) is still there as a quick shortcut.
 
 Threads: models load in the background at startup; the arm monitor reads joints at 10 Hz (the bus is
 locked, so this is safe during motion); the robot view renders the current pose (plus a ghost of the
-pose being moved to) at 10 Hz; each grasp runs in its own thread. The page gets state over
+pose being moved to) at 10 Hz; each run (agent request or direct grasp) runs in its own thread. The page gets state over
 server-sent events and video as MJPEG.
 """
 
@@ -49,6 +52,9 @@ class UiState:
     torque: bool = False
     environment: str = "real"  # real | sim (MuJoCo)
     recording: bool = True  # record an episode for the next run
+    reasoner: str = ""  # the agent's reasoning model
+    reasoning: list = field(default_factory=list)  # this run's plan, thoughts, tool calls, results: {kind, text, t}
+    thinking: str = ""  # what the model is generating right now ("" = not generating)
     version: int = 0
 
     def snapshot(self) -> dict:
@@ -61,7 +67,7 @@ class Hub:
     def __init__(self):
         self.state = UiState()
         self.cond = threading.Condition()
-        self.reset_steps()
+        self.reset_steps([])  # idle: nothing planned yet; a run fills in its own steps
 
     def update(self, **kw) -> None:
         with self.cond:
@@ -76,7 +82,7 @@ class Hub:
             self.state.version += 1
             self.cond.notify_all()
 
-    def reset_steps(self, steps: list[tuple[str, str]] = STEPS) -> None:
+    def reset_steps(self, steps: list[tuple[str, str]]) -> None:
         self.mutate(lambda s: setattr(s, "steps", [
             {"id": i, "label": lbl, "status": "pending", "message": "", "detail": {}, "images": [], "t0": None, "t1": None}
             for i, lbl in steps]))
@@ -104,9 +110,15 @@ class UiReporter:
     def add_step(self, step_id, label):
         """Append a step (agent tool calls and their parts) unless it is already in the plan."""
         def fn(s: UiState):
-            if not any(st["id"] == step_id for st in s.steps):
-                s.steps.append({"id": step_id, "label": label, "status": "pending", "message": "", "detail": {},
-                                "images": [], "t0": None, "t1": None})
+            if any(st["id"] == step_id for st in s.steps):
+                return
+            new = {"id": step_id, "label": label, "status": "pending", "message": "", "detail": {}, "images": [],
+                   "t0": None, "t1": None}
+            # A part ("t3.descend") goes right under its step and its earlier parts, not at the end of the list.
+            parent = str(step_id).rpartition(".")[0]
+            at = [i for i, st in enumerate(s.steps) if parent and (st["id"] == parent or
+                                                                    str(st["id"]).startswith(parent + "."))]
+            s.steps.insert(at[-1] + 1 if at else len(s.steps), new)
         self.hub.mutate(fn)
 
     def step(self, step_id, status, message="", detail=None, images=None):
@@ -137,6 +149,15 @@ class UiReporter:
     def log(self, message):
         self.hub.log(message)
 
+    def reasoning(self, kind, text=""):
+        def fn(s: UiState):
+            if kind == "thinking":
+                s.thinking = text or "thinking"
+                return
+            s.thinking = ""
+            s.reasoning.append({"kind": kind, "text": str(text), "t": time.time()})
+        self.hub.mutate(fn)
+
     def _wait(self, field_name: str, payload: dict):
         """Publish `payload` under state.<field_name> and block until answer() or a stop. Returns the answer."""
         cid = f"{field_name}-{time.time():.3f}"
@@ -166,7 +187,7 @@ class UiReporter:
     CONFIRM_TEXT = {  # kind -> (title, approve label, decline label)
         "grasp": ("Approve grasp?", "Approve grasp", "Cancel"),
         "plan": ("Approve the agent's plan?", "Approve plan", "Cancel (return to rest)"),
-        "hand": ("Move toward a hand?", "Go ahead", "Don't"),
+        "hand": ("Move near a person's hand?", "Go ahead", "Don't"),
     }
 
     def confirm(self, kind, prompt, images=None):
@@ -334,6 +355,7 @@ class Backend:
                                       runs_dir=None if self.environment == "real" else RUNS_DIR / "sim")
             from ..agent import Agent, build_reasoner
             self.agent = Agent(self.runner, build_reasoner(shared_vlm=parts["locator"].pointer))
+            self.hub.update(reasoner=self.agent.reasoner.name)
             self.hub.mutate(lambda s: s.status.update(models="ok"))
         except Exception as e:  # noqa: BLE001
             logger.exception("model loading failed")
@@ -416,8 +438,8 @@ class Backend:
 
         self.hub.reset_steps({"prompt": STEPS, "click": STEPS_CLICK, "agent": agent_steps()}[mode])
         self.hub.update(busy=True, query=query if mode != "click" else "", mode=mode, result="", run_dir="",
-                        target_deg=None)
-        self.hub.log({"prompt": f'run: "{query}"', "click": "run: pick by clicking", "agent": f'agent: "{query}"'}[mode]
+                        target_deg=None, reasoning=[], thinking="")
+        self.hub.log({"prompt": f'grasp: "{query}"', "click": "grasp by clicking", "agent": f'request: "{query}"'}[mode]
                      + (" (keep)" if keep and mode != "agent" else "") + ("" if record else " (not recorded)"))
 
         def work():
@@ -433,9 +455,9 @@ class Backend:
                 self.hub.update(result=f"error: {e!r}")
                 self.hub.log(f"run crashed: {e!r}")
             finally:
-                self.hub.update(busy=False, confirm=None, pick=None, target_deg=None)
+                self.hub.update(busy=False, confirm=None, pick=None, target_deg=None, thinking="")
 
-        self._run_thread = threading.Thread(target=work, daemon=True, name="grasp-run")
+        self._run_thread = threading.Thread(target=work, daemon=True, name="run")
         self._run_thread.start()
 
     def click(self, req: "ClickRequest") -> None:

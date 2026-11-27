@@ -53,6 +53,14 @@ def add_step(rep, step_id: str, label: str) -> None:
         fn(step_id, label)
 
 
+def reasoning(rep, kind: str, text: str = "") -> None:
+    """Show the agent's reasoning (plan, thoughts, tool calls, results) on reporters that display it;
+    kind "thinking" means the model is generating right now. Others ignore it."""
+    fn = getattr(rep, "reasoning", None)
+    if fn is not None:
+        fn(kind, text)
+
+
 def jsonable(o):
     return np.asarray(o).tolist()
 
@@ -75,6 +83,9 @@ class RecordingReporter:
     def log(self, message):
         self.rec.event("log", message=message)
         self.rep.log(message)
+
+    def reasoning(self, kind, text=""):
+        reasoning(self.rep, kind, text)
 
     def confirm(self, kind, prompt, images=None):
         answer = self.rep.confirm(kind, prompt, images)

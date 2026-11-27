@@ -27,7 +27,12 @@ TRUNC_M = 0.015  # signed distances are clipped to +-this (about 3 voxels)
 MAX_WEIGHT = 20.0  # cap, so a voxel can still change when the scene does
 NEAR_M = 0.07  # ignore depth closer than this to the camera (fingers, a held object)
 SURFACE = 0.4  # |tsdf| below this (in units of TRUNC_M) = on a surface
-CLEAR_ABOVE_TABLE_M = 0.012  # a table cell is clear if nothing sticks up more than this
+# A spot is blocked when enough of its cells stand this far above the table around it. Multi-view depth
+# leaves the bare table 1-2 cm uneven in the map, so smaller things (and anything flat) are left to the
+# object list; the map catches what the detector did not list.
+OBSTACLE_M = 0.015
+OBSTACLE_SHARE = 0.10  # ... and at least this share of the spot's seen cells (at least 3) do
+GROUND_RING_M = (0.02, 0.06)  # the local table level: median top in this ring around the spot
 CHANGE_DECAY = 0.1  # a view that strongly disagrees with a voxel keeps only this much of its old weight
 CHANGE = 0.8  # "strongly": new and old signed distance differ by more than this (units of TRUNC_M)
 
@@ -119,27 +124,37 @@ class SceneMap:
         X, Y = np.meshgrid(x, y, indexing="ij")
         return np.nonzero((X - xy[0]) ** 2 + (Y - xy[1]) ** 2 <= radius_m ** 2)
 
+    def _cells(self, xy: np.ndarray, r_in: float, r_out: float, ignore) -> tuple[np.ndarray, np.ndarray]:
+        """Table cells between r_in and r_out from xy, leaving out the `ignore` disks."""
+        ix, iy = self.cells_in_disk(xy, r_out)
+        x = self.lo[0] + (ix + 0.5) * self.voxel
+        y = self.lo[1] + (iy + 0.5) * self.voxel
+        keep = (x - xy[0]) ** 2 + (y - xy[1]) ** 2 >= r_in ** 2
+        for c, r in ignore or []:
+            keep &= (x - c[0]) ** 2 + (y - c[1]) ** 2 > r ** 2
+        return ix[keep], iy[keep]
+
     def spot_clear(self, xy: np.ndarray, radius_m: float, ignore: list[tuple[np.ndarray, float]] | None = None
                    ) -> tuple[bool | None, float]:
         """Is the table clear within radius_m of xy? `ignore`: (xy, radius) disks to leave out (e.g. where
-        the held object used to stand). Returns (clear, highest point above the table in m); clear is None
-        when less than half of the spot was seen."""
-        ix, iy = self.cells_in_disk(np.asarray(xy, float), radius_m)
-        if ignore:
-            x = self.lo[0] + (ix + 0.5) * self.voxel
-            y = self.lo[1] + (iy + 0.5) * self.voxel
-            keep = np.ones(ix.shape, bool)
-            for c, r in ignore:
-                keep &= (x - c[0]) ** 2 + (y - c[1]) ** 2 > r ** 2
-            ix, iy = ix[keep], iy[keep]
+        the held object used to stand). Heights are measured from the table level just around the spot.
+        Returns (clear, highest point above that level in m); clear is None when less than half of the
+        spot was seen."""
+        xy = np.asarray(xy, float)
+        hm = self.height_map()
+        ix, iy = self._cells(xy, 0.0, radius_m, ignore)
         if ix.size == 0:
             return None, 0.0
-        top = self.height_map()[ix, iy]
+        top = hm[ix, iy]
         seen = np.isfinite(top)
         if seen.mean() < 0.5:
             return None, 0.0
-        highest = float(np.nanmax(top) - self.table_z)
-        return highest <= CLEAR_ABOVE_TABLE_M, highest
+        gx, gy = self._cells(xy, radius_m + GROUND_RING_M[0], radius_m + GROUND_RING_M[1], ignore)
+        ring = hm[gx, gy]
+        ground = float(np.nanmedian(ring)) if np.isfinite(ring).sum() >= 10 else self.table_z
+        above = top[seen] - ground
+        high = int((above > OBSTACLE_M).sum())
+        return bool(high < max(3, OBSTACLE_SHARE * seen.sum())), float(above.max())
 
     # ------------------------------------------------------------------ output
     def save(self, out_dir: Path) -> list[Path]:

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>SO-101 zero-shot grasping</title>
+<title>SO-101 zero-shot robot</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root {
@@ -73,8 +73,25 @@
   .dialog .imgs img { max-height: 62vh; max-width: 44vw; border-radius: 6px; border: 1px solid var(--line); }
   .dialog .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
   .approve { background: var(--ok); color: #04130b; } .cancel { background: var(--panel2); color: var(--text); border: 1px solid var(--line) !important; }
+  .reasoning { flex: 0 0 32%; min-height: 170px; display: flex; flex-direction: column; }
+  .reasoning h2 .name { text-transform: none; letter-spacing: 0; color: var(--text); font-weight: 400; margin-left: auto; }
+  .rlog { overflow: auto; flex: 1; padding: 6px 12px 10px; font-size: 13px; }
+  .rlog .empty { color: var(--muted); padding: 6px 0; }
+  .r { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 8px; padding: 4px 0; border-bottom: 1px solid #1f232c; }
+  .r .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding-top: 2px; }
+  .r .v { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .r.plan .v { background: var(--panel2); border-left: 3px solid var(--accent); padding: 6px 8px; border-radius: 4px; font: 12.5px/1.45 ui-monospace, monospace; }
+  .r.call .v { font: 12.5px/1.4 ui-monospace, monospace; color: #8fb6ff; }
+  .r.result .v { color: var(--muted); } .r.result.bad .v { color: var(--bad); }
+  .r.check .v { color: var(--warn); } .r.reply .v { color: var(--muted); font-style: italic; }
+  .r.finished .v, .r.refused .v { font-weight: 600; }
+  .r.thinking .v { color: var(--accent); display: flex; align-items: center; gap: 8px; }
   .lightbox img { max-width: 92vw; max-height: 90vh; border-radius: 8px; }
   .pickbtn { background: #7c5cff; color: white; }
+  .controls.quick { opacity: 0.85; }
+  .controls.quick .btn { font-size: 0.85em; }
+  .quicklabel { color: var(--muted, #888); font-size: 0.85em; }
+  .steplist .empty { color: var(--muted, #888); padding: 12px 4px; line-height: 1.5; }
   .imgwrap.picking { outline: 3px solid #7c5cff; outline-offset: -3px; }
   .imgwrap.picking img { cursor: crosshair; }
   .banner { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); background: #7c5cff; color: white;
@@ -87,7 +104,7 @@
 </head>
 <body>
 <header>
-  <h1>SO-101 zero-shot grasping</h1>
+  <h1>SO-101 zero-shot robot</h1>
   <span class="chip" id="chip-models">models</span>
   <span class="chip" id="chip-arm">arm</span>
   <span class="chip" id="chip-camera">camera</span>
@@ -112,20 +129,27 @@
         <div class="clickmark" id="clickmark"></div>
       </div>
       <div class="controls">
-        <input id="prompt" type="text" placeholder='Run: an object to pick up ("black marker"). Ask agent: any request ("put the red cube next to the blue can")' autocomplete="off">
-        <label class="keep"><input type="checkbox" id="keep"> keep holding</label>
+        <input id="prompt" type="text" placeholder='Ask the robot to do something ("knock over the blue cylinder", "put the red cube next to the yellow ball")' autocomplete="off">
+        <button class="btn agentbtn" id="agentbtn" title="The robot looks around, proposes a plan for your OK, then carries it out (it asks before moving near a hand)">Ask</button>
         <label class="keep" title="Save this run as an episode (camera frames + robot state + outcome)"><input type="checkbox" id="record"> record</label>
-        <button class="btn run" id="run" title="Find the named object and grasp it">Run</button>
-        <button class="btn agentbtn" id="agentbtn" title="Let the agent plan and carry out the request (it asks before moving)">Ask agent</button>
-        <button class="btn pickbtn" id="pickbtn" title="Move to the scan pose, then click the object in the camera view">Pick by clicking</button>
         <button class="btn stop" id="stop" title="Hold, then return to rest. Press again while returning to cut torque where it is.">Stop</button>
         <button class="btn estop" id="estop" title="Disable torque immediately: the arm drops onto its stops.">E-STOP</button>
+      </div>
+      <div class="controls quick">
+        <span class="quicklabel" title="Shortcuts that skip the planning: the classic grasp pipeline">Quick grasp:</span>
+        <button class="btn run" id="run" title="Find the object named in the box and grasp it (no planning)">Grasp named object</button>
+        <button class="btn pickbtn" id="pickbtn" title="Move to the scan pose, then click the object in the camera view">Grasp by clicking</button>
+        <label class="keep"><input type="checkbox" id="keep"> keep holding</label>
       </div>
       <div class="controls" id="simcontrols" style="display:none">
         <span class="chip warn">MuJoCo simulation</span>
         <button class="btn" id="simreset" title="Objects back to their starting places, arm to rest">Reset scene</button>
         <button class="btn" id="simshuffle" title="Objects moved up to 3 cm and turned at random, arm to rest">Shuffle objects</button>
       </div>
+    </div>
+    <div class="card reasoning">
+      <h2>Model reasoning <span class="name" id="reasoner"></span></h2>
+      <div class="rlog" id="rlog"></div>
     </div>
   </section>
 
@@ -140,7 +164,7 @@
       <div class="joints" id="joints"></div>
     </div>
     <div class="card steps">
-      <h2>Plan <span id="query" style="text-transform:none;letter-spacing:0;color:var(--text)"></span></h2>
+      <h2>Steps <span id="query" style="text-transform:none;letter-spacing:0;color:var(--text)"></span></h2>
       <div class="steplist" id="steps"></div>
       <div class="log" id="log"></div>
     </div>
@@ -149,7 +173,7 @@
 
 <div class="modal" id="confirm">
   <div class="dialog">
-    <h3 id="confirm-title">Approve grasp?</h3>
+    <h3 id="confirm-title">Approve?</h3>
     <p id="confirm-prompt"></p>
     <div class="imgs" id="confirm-imgs"></div>
     <div class="actions" id="confirm-actions"></div>
@@ -206,8 +230,8 @@ function render(s) {
   $("prompt").disabled = s.busy;
   $("record").checked = !!s.recording;
   $("record").disabled = s.busy;
-  $("query").textContent = s.query ? (s.mode === "agent" ? `agent: "${s.query}"` : `"${s.query}"`)
-    : (s.mode === "click" && (s.busy || s.result) ? "(picked by clicking)" : "");
+  $("query").textContent = s.query ? (s.mode === "agent" ? `"${s.query}"` : `grasp: "${s.query}"`)
+    : (s.mode === "click" && (s.busy || s.result) ? "(grasp by clicking)" : "");
   const wrap = document.querySelector(".imgwrap");
   wrap.classList.toggle("picking", !!s.pick);
   $("banner").textContent = s.pick ? s.pick.prompt : "";
@@ -219,14 +243,17 @@ function render(s) {
   res.className = "result " + (good ? "held" : (s.result ? "bad" : ""));
 
   const active = s.steps.find(x => x.status === "active");
-  $("overlay-step").textContent = active ? active.label : (s.busy ? "working..." : "idle");
+  $("overlay-step").textContent = s.thinking ? `model thinking: ${s.thinking}...`
+    : (active ? active.label : (s.busy ? "working..." : "idle"));
 
   if (s.joints_deg) {
     const vals = [...s.joints_deg, s.gripper_pct];
     $("joints").innerHTML = vals.map((v, i) => `<div>${JOINTS[i]}<b>${v == null ? "-" : Number(v).toFixed(1)}</b></div>`).join("");
   }
 
-  $("steps").innerHTML = s.steps.map(st => {
+  $("steps").innerHTML = s.steps.length ? "" : `<div class="empty">Ask the robot for anything. It looks around,
+    proposes a plan for your OK, and each step it takes shows up here.</div>`;
+  if (s.steps.length) $("steps").innerHTML = s.steps.map(st => {
     const icon = st.status === "active" ? '<span class="spin"></span>' : (ICON[st.status] || "○");
     const open = expanded.has(st.id) || st.status === "active" || st.status === "failed";
     const det = Object.entries(st.detail || {});
@@ -239,6 +266,8 @@ function render(s) {
       <div class="row"><span class="icon">${icon}</span><span class="label">${esc(st.label)}</span><span class="time">${elapsed(st)}</span></div>
       ${st.message ? `<div class="msg">${esc(st.message)}</div>` : ""}${body}</div>`;
   }).join("");
+
+  renderReasoning(s);
 
   const log = $("log"); const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
   log.innerHTML = s.logs.map(esc).join("<br>");
@@ -259,6 +288,30 @@ function render(s) {
   }
 }
 
+const RKIND = { plan: "plan", thought: "thinks", call: "calls", result: "robot", check: "check", reply: "replied",
+                refused: "refuses", finished: "finished" };
+let reasoningKey = "";
+function renderReasoning(s) {
+  $("reasoner").textContent = s.reasoner || "";
+  const items = s.reasoning || [];
+  const key = items.length + "|" + (s.thinking || "") + "|" + s.mode;
+  if (key === reasoningKey) return;  // unchanged: keep the scroll position and any selection
+  reasoningKey = key;
+  const box = $("rlog"), atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  if (!items.length && !s.thinking) {
+    box.innerHTML = `<div class="empty">${s.mode === "agent" || !s.query
+      ? "The model's plan, what it is thinking at each step, the tool it calls and what the robot reports back show up here."
+      : "Quick grasps run without the reasoning model."}</div>`;
+    return;
+  }
+  box.innerHTML = items.map(r => {
+    const bad = r.kind === "result" && r.text.startsWith("FAILED");
+    if (r.kind === "thought" && !r.text.trim()) return "";
+    return `<div class="r ${r.kind}${bad ? " bad" : ""}"><div class="k">${RKIND[r.kind] || r.kind}</div><div class="v">${esc(r.text)}</div></div>`;
+  }).join("") + (s.thinking ? `<div class="r thinking"><div class="k">model</div><div class="v"><span class="spin"></span>thinking: ${esc(s.thinking)}...</div></div>` : "");
+  if (atBottom || s.thinking) box.scrollTop = box.scrollHeight;
+}
+
 $("steps").addEventListener("click", (e) => {
   const img = e.target.closest("img[data-full]");
   if (img) { $("lightbox-img").src = img.dataset.full; $("lightbox").classList.add("show"); return; }
@@ -268,7 +321,7 @@ $("steps").addEventListener("click", (e) => {
 });
 $("lightbox").addEventListener("click", () => $("lightbox").classList.remove("show"));
 $("run").addEventListener("click", () => post("/api/run", { query: $("prompt").value, keep: $("keep").checked }));
-$("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !$("run").disabled) $("run").click(); });
+$("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !$("agentbtn").disabled) $("agentbtn").click(); });
 $("stop").addEventListener("click", () => post("/api/stop"));
 $("estop").addEventListener("click", () => post("/api/estop"));
 $("record").addEventListener("change", (e) => post("/api/recording", { enabled: e.target.checked }));

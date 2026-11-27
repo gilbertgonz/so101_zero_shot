@@ -1,12 +1,11 @@
 """Run a free-form request with the agent (terminal version of the UI's Agent mode).
 
-The robot looks around, the local VLM proposes a plan, you approve it, then it calls one skill at a time
-(look, pick up, place, touch, give to a hand, ...) until it finishes. Grasps and moves toward a hand ask
-again unless --yes.
+The robot looks around, the local VLM proposes a plan, you approve it, then it calls one tool at a time
+(look, pick up, place, move the gripper along any path) until it finishes. Grasps and paths near a hand
+ask again unless --yes.
 
 Usage:
-  agent.py "put the red cube next to the blue can" --sim
-  agent.py "give me a high five" --sim --hand-five       sim: hold up a hand for a high five
+  agent.py "knock over the blue cylinder" --sim
   agent.py REQUEST                                      on the real arm
   --reasoner SPEC  reasoning model, e.g. hf:Qwen/Qwen3-VL-8B-Instruct@4bit (default: config agent.reasoner)
   --yes          approve everything automatically (sim testing)
@@ -71,7 +70,6 @@ def main() -> None:
     ap.add_argument("--speed", type=float, default=30.0)
     ap.add_argument("--max-steps", type=int, default=AgentConfig.max_steps)
     ap.add_argument("--video", default=None, help="sim: save a video of the run (mp4, 4x speed)")
-    ap.add_argument("--hand-five", action="store_true", help="sim: a hand held up for a high five")
     ap.add_argument("--hand-down", action="store_true", help="sim: a hand lying palm down on the table")
     args = ap.parse_args()
 
@@ -89,9 +87,7 @@ def main() -> None:
 
         world = SimWorld(cfg, parts["cam_model"])
         world.start()
-        if args.hand_five:
-            world.set_hand(*world.HAND_PLACEMENTS["five"])
-        elif args.hand_down:
+        if args.hand_down:
             world.set_hand(*world.HAND_PLACEMENTS["down"])
         camera, arm = SimWristCamera(world), make_mujoco_arm(cfg, world)
     else:

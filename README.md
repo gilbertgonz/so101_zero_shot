@@ -56,21 +56,29 @@ moving, so `perception.look.camera_latency_s` (exposure to timestamp delay) need
 
 ## Use
 - `scripts/ui.py`: web UI at http://127.0.0.1:8000: live wrist camera, live arm view (cyan ghost = pose it
-  is moving to), prompt, step-by-step plan with images, approve/cancel, Stop, E-STOP.
-  **Pick by clicking**: click an object in the camera view (either view); the robot masks and
-  measures it, names it, and shows what it found and where before asking to grasp it.
-- `scripts/grasp.py "object"`: the same grasp from the terminal (`--dry-run SCENE` plans from a saved scene).
+  is moving to), a request box, step-by-step panel with images, approve/cancel, Stop, E-STOP.
+  **Ask**: any request ("knock over the blue cylinder", "put the red cube next to the yellow ball"). The
+  agent looks around, proposes a plan for your OK, then uses its tools one at a time: look around / look
+  at / find hands, pick up, place at, and move the gripper through any list of 3D points (opening or
+  closing it at the end), which covers motions no other tool names. A local VLM does the reasoning
+  (`agent.reasoner` in `config/robot.yaml`, swappable).
+  **Quick grasp** shortcuts skip the planning: grasp a named object, or click one in the camera view (the
+  robot masks and measures it, names it, and shows what it found before asking to grasp it).
+- `scripts/agent.py "request"`: the agent from the terminal.
+- `scripts/benchmark.py`: the agent benchmark in the sim (5 tasks x 3 shifted scenes, scored from the true
+  object positions, a video per run and a mosaic); `--reasoner` compares reasoning models.
+- `scripts/grasp.py "object"`: the direct grasp from the terminal (`--dry-run SCENE` plans from a saved scene).
 
 ### Simulation (no arm needed)
 `scripts/ui.py --sim` (or `scripts/grasp.py --sim "red cube"`) runs the whole stack on a MuJoCo arm on a
-table with five objects (red cube, blue can, yellow ball, black marker, green block;
+table with five objects (red cube, blue cylinder, yellow ball, permanent marker, green block;
 `assets/so101/sim_scene.xml`). The real arm code drives simulated servos, the wrist camera is rendered
 through the calibrated fisheye model, and grasps are physics. The UI gets **Reset scene** / **Shuffle objects**
 buttons. Simulated runs and episodes go to `runs/sim/` (not uploaded); `scripts/episodes.py --sim list`.
 
 ## Recorded episodes
 Runs on the arm (UI or terminal, prompt or click) are recorded from the start confirmation until torque
-is off, into their run folder. The UI's **record** checkbox (next to Run) turns it off for the next runs;
+is off, into their run folder. The UI's **record** checkbox (next to Ask) turns it off for the next runs;
 `scripts/grasp.py --no-record` for the terminal; `recording.enabled` in `config/robot.yaml` is the default:
 - `episode.parquet`: one row per sample (10 Hz, `recording:` in `config/robot.yaml`): `timestamp`,
   `observation.images.wrist` (raw fisheye frame, JPEG, 800x600), `observation.state` (5 joints in deg +
