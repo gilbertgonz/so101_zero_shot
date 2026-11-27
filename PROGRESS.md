@@ -282,3 +282,7 @@ Next
 - Real arm: measure camera latency (frame timestamp vs exposure) and check heights against hand-measured
   objects; motion blur at 30 deg/s.
 - The height tail (1-2 cm on ~20% of objects in sim) is the main remaining depth weakness.
+
+## Tests removed
+- Dropped the unit tests (tests/, pytest extra and config). The end-to-end check is now a simulated run:
+  `scripts/grasp.py "red cube" --sim` (README "Setup").

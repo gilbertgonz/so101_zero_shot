@@ -35,7 +35,7 @@ DOWN = np.array([0.0, 0.0, -1.0])
 APPROACHES = ("down", "forward", "auto")
 # touch(): creep toward the target in steps this long, at this speed, and call it contact when a joint
 # lags its command by this much or a load (0.1 % of max torque) rises this far above the free-space value.
-# Measured in the MuJoCo sim (see tests/test_skills.py); to be measured on the real arm like the gripper.
+# Measured in the MuJoCo sim; to be measured on the real arm like the gripper.
 TOUCH_STEP_M = 0.004
 TOUCH_SPEED = 8.0
 TOUCH_LAG_DEG = 1.5

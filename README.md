@@ -14,8 +14,11 @@ https://github.com/user-attachments/assets/5e1c48a6-4354-42b8-9a45-cb0b77081d4b
 ```
 python3 -m venv .venv
 .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-.venv/bin/pip install -e '.[sim,dev,perception,quant,multiview,ui]'
-.venv/bin/pytest
+.venv/bin/pip install -e '.[sim,perception,quant,multiview,ui]'
+```
+Check the whole pipeline end to end in MuJoCo (scan, locate, re-look, plan, grasp, put back; should end with `result: held`):
+```
+.venv/bin/python scripts/grasp.py "red cube" --sim
 ```
 
 ### Depth
