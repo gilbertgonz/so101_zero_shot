@@ -130,8 +130,9 @@
       </div>
       <div class="controls">
         <input id="prompt" type="text" placeholder='Ask the robot to do something ("knock over the blue cylinder", "put the red cube next to the yellow ball")' autocomplete="off">
-        <button class="btn agentbtn" id="agentbtn" title="The robot looks around, proposes a plan for your OK, then carries it out (it asks before moving near a hand)">Ask</button>
+        <button class="btn agentbtn" id="agentbtn" title="The robot looks around, makes a plan, then carries it out">Ask</button>
         <label class="keep" title="Save this run as an episode (camera frames + robot state + outcome)"><input type="checkbox" id="record"> record</label>
+        <label class="keep" title="Ask before acting: the plan, each grasp, moving near a hand. Off: the robot goes ahead without asking."><input type="checkbox" id="approval"> require approval</label>
         <button class="btn stop" id="stop" title="Hold, then return to rest. Press again while returning to cut torque where it is.">Stop</button>
         <button class="btn estop" id="estop" title="Disable torque immediately: the arm drops onto its stops.">E-STOP</button>
       </div>
@@ -230,6 +231,7 @@ function render(s) {
   $("prompt").disabled = s.busy;
   $("record").checked = !!s.recording;
   $("record").disabled = s.busy;
+  $("approval").checked = !!s.require_approval;
   $("query").textContent = s.query ? (s.mode === "agent" ? `"${s.query}"` : `grasp: "${s.query}"`)
     : (s.mode === "click" && (s.busy || s.result) ? "(grasp by clicking)" : "");
   const wrap = document.querySelector(".imgwrap");
@@ -325,6 +327,7 @@ $("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !$("ag
 $("stop").addEventListener("click", () => post("/api/stop"));
 $("estop").addEventListener("click", () => post("/api/estop"));
 $("record").addEventListener("change", (e) => post("/api/recording", { enabled: e.target.checked }));
+$("approval").addEventListener("change", (e) => post("/api/approval", { enabled: e.target.checked }));
 $("simreset").addEventListener("click", () => post("/api/sim/reset", { shuffle: false }));
 $("simshuffle").addEventListener("click", () => post("/api/sim/reset", { shuffle: true }));
 $("confirm-actions").addEventListener("click", (e) => {

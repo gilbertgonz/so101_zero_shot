@@ -1,7 +1,9 @@
 """Local web UI: live wrist camera, live arm view, a request box, step-by-step panel, approvals, stop.
 
-Requests go to the agent (any task: it looks, plans, asks for approval and runs tools); the direct grasp
-pipeline (a named object, or one clicked in the camera view) is still there as a quick shortcut.
+Requests go to the agent (any task: it looks, plans and runs tools); the direct grasp pipeline (a named
+object, or one clicked in the camera view) is still there as a quick shortcut. Nothing asks for approval
+unless "require approval" is ticked (off by default): then the plan, each grasp and moves near a hand wait
+for an OK.
 
 Threads: models load in the background at startup; the arm monitor reads joints at 10 Hz (the bus is
 locked, so this is safe during motion); the robot view renders the current pose (plus a ghost of the
@@ -52,6 +54,7 @@ class UiState:
     torque: bool = False
     environment: str = "real"  # real | sim (MuJoCo)
     recording: bool = True  # record an episode for the next run
+    require_approval: bool = False  # off: every approval question is answered "yes" without asking
     reasoner: str = ""  # the agent's reasoning model
     reasoning: list = field(default_factory=list)  # this run's plan, thoughts, tool calls, results: {kind, text, t}
     thinking: str = ""  # what the model is generating right now ("" = not generating)
@@ -197,7 +200,15 @@ class UiReporter:
         value = self.choose(kind, title, prompt, [("yes", yes), ("no", no)], images)
         return value == "yes"
 
+    APPROVE = ("yes", "grasp")  # the option values that mean "go ahead"
+
     def choose(self, kind, title, prompt, options, images=None):
+        if not self.hub.state.require_approval:
+            # Not asking: take the go-ahead option, or cancel when there is none (e.g. the clicked object is
+            # out of reach), rather than loop on "pick again".
+            value = next((v for v, _ in options if v in self.APPROVE), "cancel")
+            self.hub.log(f"{kind}: auto-{'approved' if value in self.APPROVE else 'cancelled'} (approval off)")
+            return value
         value = self._wait("confirm", {
             "kind": kind, "title": title, "prompt": prompt,
             "images": [file_url(p) for p in images or [] if Path(p).exists()],
@@ -230,6 +241,10 @@ class ClickRequest(BaseModel):
 
 
 class RecordingRequest(BaseModel):
+    enabled: bool
+
+
+class ApprovalRequest(BaseModel):
     enabled: bool
 
 
@@ -604,6 +619,13 @@ def create_app(sim: bool = False) -> FastAPI:
             raise HTTPException(409, "a run is in progress; change recording before the next run")
         backend.hub.update(recording=req.enabled)
         backend.hub.log("episode recording " + ("on" if req.enabled else "off") + " for the next runs")
+        return {"ok": True}
+
+    @app.post("/api/approval")
+    def set_approval(req: ApprovalRequest):
+        # Takes effect at the next question, also during a run; one already on screen still waits for an answer.
+        backend.hub.update(require_approval=req.enabled)
+        backend.hub.log("approval " + ("required" if req.enabled else "off: actions go ahead without asking"))
         return {"ok": True}
 
     @app.post("/api/sim/reset")

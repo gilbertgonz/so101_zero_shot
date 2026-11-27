@@ -56,14 +56,15 @@ moving, so `perception.look.camera_latency_s` (exposure to timestamp delay) need
 
 ## Use
 - `scripts/ui.py`: web UI at http://127.0.0.1:8000: live wrist camera, live arm view (cyan ghost = pose it
-  is moving to), a request box, step-by-step panel with images, approve/cancel, Stop, E-STOP.
+  is moving to), a request box, step-by-step panel with images, Stop, E-STOP.
   **Ask**: any request ("knock over the blue cylinder", "put the red cube next to the yellow ball"). The
-  agent looks around, proposes a plan for your OK, then uses its tools one at a time: look around / look
+  agent looks around, makes a plan, then uses its tools one at a time: look around / look
   at / find hands, pick up, place at, and move the gripper through any list of 3D points (opening or
   closing it at the end), which covers motions no other tool names. A local VLM does the reasoning
   (`agent.reasoner` in `config/robot.yaml`, swappable).
   **Quick grasp** shortcuts skip the planning: grasp a named object, or click one in the camera view (the
-  robot masks and measures it, names it, and shows what it found before asking to grasp it).
+  robot masks and measures it, names it, and grasps it).
+  **require approval** (off by default): ask before the plan, each grasp, and moves near a hand.
 - `scripts/agent.py "request"`: the agent from the terminal.
 - `scripts/benchmark.py`: the agent benchmark in the sim (5 tasks x 3 shifted scenes, scored from the true
   object positions, a video per run and a mosaic); `--reasoner` compares reasoning models.
