@@ -49,7 +49,8 @@ TOOL_SPECS = [
     _fn("find_hands", "Look for human hands in front of the robot (from the scan pose)."),
     _fn("pick_up", "Grasp an object from above and lift it; the robot keeps holding it. One object at a time.",
         {"id": ID}, ["id"]),
-    _fn("place_at", "Put the held object down at a point on the table (cm, base frame).",
+    _fn("place_at", "Put the held object down at a point (cm, base frame): on the table, or on top of whatever "
+        "stands there.",
         {"x_cm": {"type": "number"}, "y_cm": {"type": "number"}}, ["x_cm", "y_cm"]),
     _fn("move_gripper", "Move the gripper's fingertips through a list of points, in straight lines from one point to "
         "the next (it first travels high to the first point). Points are [x, y, z] in cm in the base frame, z = "
@@ -232,36 +233,34 @@ class Toolbox:
         xy = np.array([float(x_cm), float(y_cm)]) / 100.0
         h = self._held_obj()
         held_r = 0.5 * max(h.length_m, h.width_m, 0.03) if h is not None else 0.025
-        if not self._spot_is_free(xy, held_r, exclude={self.picked_id}):
-            return ToolResult(False, f"x={float(x_cm):.0f} y={float(y_cm):.0f} cm is taken by another object; "
-                                     "choose a free spot")
+        on_z, under = self._surface_under(xy, held_r)
         self.s.begin("place")
-        where = self.sk.place_at(xy)
-        self.s.rep.step("place", "done", f"at ({float(x_cm):.0f}, {float(y_cm):.0f}) cm")
+        where = self.sk.place_at(xy, on_z)
+        at = f"x={float(x_cm):.0f} y={float(y_cm):.0f} cm"
+        on = f", on top of {under} ({on_z * 100:.0f} cm up)" if under else ""
+        self.s.rep.step("place", "done", f"at ({float(x_cm):.0f}, {float(y_cm):.0f}) cm{on}")
         name = self.picked_id
         self._after_release(where)
-        return ToolResult(True, f"Put {name} down at x={float(x_cm):.0f} y={float(y_cm):.0f} cm.")
+        return ToolResult(True, f"Put {name} down at {at}{on}.")
 
-    def _spot_is_free(self, xy: np.ndarray, radius: float, exclude: set) -> bool:
-        """Clear of every remembered object (footprints) and, where the 3D map has seen it, of anything else
-        sticking up from the table (things the detector did not list). `exclude`: object ids to ignore (the
-        held one, the one to place next to)."""
-        ignore = []
-        for other in self.scene.objects.values():
-            r = 0.5 * max(other.length_m, other.width_m, 0.02)
-            if other.name in exclude or other.held:
-                ignore.append((other.center_m[:2], r + 0.01))  # where it stands (or stood) in the map too
+    def _surface_under(self, xy: np.ndarray, held_r: float) -> tuple[float, str]:
+        """Height (m) of what the held object would come down on at xy, and what that is ("" = the table):
+        the highest listed object under its middle, or else anything the 3D map saw sticking up there (things
+        the detector did not list). place_at sets the object down on it instead of pushing into it."""
+        top, what, ignore = 0.0, "", []
+        for o in self.scene.objects.values():
+            r = 0.5 * max(o.length_m, o.width_m, 0.02)
+            if o.name == self.picked_id or o.held or o.kind == "hand":
+                ignore.append((o.center_m[:2], r + 0.01))  # where the held one stood, for the map below
                 continue
-            if np.linalg.norm(other.center_m[:2] - xy) < r + radius + 0.01:
-                return False
+            if np.linalg.norm(o.center_m[:2] - xy) < r + 0.5 * held_r and o.top_z_m > top:
+                top, what = float(o.top_z_m), f"{o.name} ({o.label})"
         scene_map = self.sk.scene_map
-        if scene_map is not None and scene_map.views:
-            clear, top = scene_map.spot_clear(np.asarray(xy, float), radius + 0.005, ignore)
+        if not what and scene_map is not None and scene_map.views:
+            clear, high = scene_map.spot_clear(np.asarray(xy, float), held_r, ignore)
             if clear is False:
-                logger.info("spot (%.0f, %.0f) cm: the 3D map has something %.1f cm tall there",
-                            xy[0] * 100, xy[1] * 100, top * 100)
-                return False
-        return True
+                top, what = high, "something the camera saw there"
+        return top, what
 
     def _check_hands(self, pts: list[np.ndarray]) -> None:
         """Ask the person before a path passes close to one of their hands."""

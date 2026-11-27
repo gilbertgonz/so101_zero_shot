@@ -465,13 +465,14 @@ class Skills:
         self.travel_to(q, gripper=gripper, speed=speed)
         return used
 
-    def place_at(self, xy_m: np.ndarray) -> np.ndarray:
-        """Set the held object down with its centre at `xy_m` (table): same fingertip height as it was
-        picked at, open, back up, close. Returns the placed position (x, y, top z)."""
+    def place_at(self, xy_m: np.ndarray, on_z_m: float = 0.0) -> np.ndarray:
+        """Set the held object down with its centre at `xy_m`, its bottom at height `on_z_m` (0 = the table;
+        the top of something to stack it on): fingertips as high above that as when it was picked, open, back
+        up, close. Returns the placed position (x, y, top z)."""
         if self.held is None:
             raise SkillFailed("not holding anything")
         h = self.held
-        target = np.array([xy_m[0], xy_m[1], h.plan.target_m[2] + 0.005])
+        target = np.array([xy_m[0], xy_m[1], on_z_m + h.plan.target_m[2] + 0.005])
         try:
             self.cfg.check_in_workspace(target)
             plan = self.planner.plan_grasp(target, None, self.arm.read_joints())
@@ -483,7 +484,7 @@ class Skills:
         self._drive(plan.lift_deg, speed=DESCEND_SPEED)
         self.arm.set_gripper(0.0, duration_s=0.6)
         self.held = None
-        return np.array([xy_m[0], xy_m[1], h.top_z_m])
+        return np.array([xy_m[0], xy_m[1], on_z_m + h.top_z_m])
 
     def _solve_near(self, point_m: np.ndarray, q_prev: np.ndarray) -> tuple[np.ndarray, str]:
         """Like solve(), but of the valid solutions (down, forward, any angle) the one closest to q_prev, so a

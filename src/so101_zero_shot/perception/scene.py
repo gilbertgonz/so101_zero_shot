@@ -180,6 +180,7 @@ class Scene:
         """The robot moved an object: update where it is (until it is seen again)."""
         o = self.get(ref)
         o.center_m = np.asarray(center_m, dtype=float).copy()
+        o.top_z_m = float(o.center_m[2])  # higher than its own height when it was stacked on something
         o.held = False
 
     def describe(self) -> str:
