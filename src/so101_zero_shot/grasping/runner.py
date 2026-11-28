@@ -281,7 +281,7 @@ class GraspRunner:
             return RunResult(out, "declined", log)
 
         def body(s: Session, sk: Skills) -> None:
-            s.begin("home", sk.rest)
+            s.begin("home", sk.scan)
             sk.home()
             s.rep.step("home", "done")
             if query:

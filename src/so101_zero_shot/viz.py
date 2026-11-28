@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import os
 from pathlib import Path
 
@@ -48,8 +50,11 @@ class LiveRenderer:
     """
 
     def __init__(self, size=(480, 360), azimuth: float = 135.0, elevation: float = -25.0,
-                 open_gap_m: float = DEFAULT_OPEN_GAP_M, scene_path: Path = MJCF_SCENE_PATH):
-        self.model = mujoco.MjModel.from_xml_path(str(scene_path))
+                 open_gap_m: float = DEFAULT_OPEN_GAP_M, scene_path: Path = MJCF_SCENE_PATH,
+                 model: mujoco.MjModel | None = None):
+        """`model`: render this model (a copy of it) instead of loading `scene_path`, e.g. the simulation's
+        own, so its objects and look match."""
+        self.model = copy.deepcopy(model) if model is not None else mujoco.MjModel.from_xml_path(str(scene_path))
         self.data = mujoco.MjData(self.model)
         w, h = size
         self.model.vis.global_.offwidth, self.model.vis.global_.offheight = max(w, 640), max(h, 480)

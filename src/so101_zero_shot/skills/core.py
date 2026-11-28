@@ -179,8 +179,14 @@ class Skills:
                          compensate=compensate)
 
     def home(self) -> None:
-        """Rest pose, gripper closed (start of a run: no settle wait, like before)."""
-        self.arm.move_to(self.rest, gripper=0.0, speed_deg_s=self.speed)
+        """Home = the scan pose (above the table, camera on it), gripper closed: where a run starts and what
+        go_home returns to. The folded rest pose is only for parking at the end, before torque goes off: on
+        its stops it does not fall when the motors go limp (the scan pose would)."""
+        self.arm.move_to(self.scan, gripper=0.0, speed_deg_s=self.speed)
+
+    def go_home(self) -> None:
+        """Back to home (the scan pose) at <= 30 deg/s, from wherever the arm is."""
+        self._drive(self.scan, speed=min(self.speed, 30.0))
 
     def go_scan(self) -> None:
         """To the scan pose, keeping frames from the way (multi-view depth for a photo taken there)."""
@@ -236,6 +242,8 @@ class Skills:
             self.move_collecting(q_cmd)
             time.sleep(1.0)  # auto exposure settles after the move
         frames = self._move_frames
+        if self.locator is not None:
+            self.locator.holding = self.held is not None  # keep the held object out of the scene map
         img, q = self.photo(None, tag)
         here = self._camera_center(q)
         prior_ok = prior is not None and np.linalg.norm(self._camera_center(prior[1]) - here) >= MIN_BASELINE_M
@@ -390,6 +398,10 @@ class Skills:
     def close(self) -> Grip:
         self.arm.set_gripper(0.0, duration_s=1.0)
         return Grip(*read_grip(self.arm))
+
+    def grip(self) -> Grip:
+        """The gripper's opening and squeeze force right now (is anything between the fingers?)."""
+        return Grip(*read_grip(self.arm, seconds=0.3))
 
     def lift(self, plan: GraspPlan) -> Grip:
         """Up to the lift pose; the returned grip says whether something is held."""

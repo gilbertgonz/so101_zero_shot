@@ -1,13 +1,19 @@
 """The agent: a local VLM plans and runs a free-form request with the tools in agent/tools.py.
 
-  1. home, look around (three views), build the numbered scene list
+  1. home, one look at the table (the centre view), build the numbered scene list; the full three-view
+     look_around is a tool the model calls when what it needs is not in the list
   2. plan: the model writes a short numbered plan, or "CANNOT: why" (the run ends, nothing moves)
   3. the person approves the plan once
   4. loop: the model sees the request, the plan, the latest marked camera view and every tool result so
      far, and calls one tool (one JSON function call). Grasps and moves toward a hand ask for approval.
-     It ends with finish(success, message), or when the step / time budget runs out. The first
-     finish(success=true) is answered with a check instead: the request again and the list of what was
-     actually done, so a multi-part request is not called done halfway.
+     After every action (pick_up, place_at, move_gripper, done or failed) the robot looks at the table
+     again (the same centre view, about 12 s): the scene list is updated from what it sees
+     (what that view had in sight but did not find is dropped), and the model gets the new view with the
+     request, to compare what is there with what was asked. A tool's own report ("put it down") is not taken as proof: an object can slip out on the
+     way. It ends with finish(success, message), or when the step / time budget runs out. The first
+     finish(success=true) is answered with a check instead: a fresh look (unless the robot has not moved
+     since the last one), the request again and what was done, so a request is not called done halfway
+     or on the strength of a tool report alone.
 
 Only the latest camera image is kept in the model's context (older ones are replaced by a note), so a
 long run does not slow down or run out of memory. Every tool call and result is shown as a step in the
@@ -46,7 +52,7 @@ Rules:
 - Use the numbers from the latest scene list. If what you need is not in the list, use look_around, look_at or find_hands first.
 - Distances, sides and sizes are already worked out in the scene list (closest first, CLOSEST, FURTHEST, TALLEST); use them instead of guessing from the image.
 - After a failure, think about the reason and try something different; try the same thing at most twice.
-- If the request names an object that is still not in the scene list after looking around, it is not on the table: call finish with success false and say so. Never use a different object instead.
+- The first scene list comes from one view straight ahead. If the request names an object that is not in it, call look_around (left, centre and right) before deciding. If it is still not in the scene list after look_around, it is not on the table: call finish with success false and say so. Never use a different object instead.
 - When the request is done, or cannot be done, call finish with success true or false and a short message for the person."""
 
 PLAN_PROMPT = """Request from the person: "{request}"
@@ -65,10 +71,20 @@ If what the request needs is not in the scene list, start with look_around or lo
 GO_PROMPT = ("The person approved the plan. Carry it out now: in each reply write one short sentence, then exactly "
              "one tool call {call_hint}.")
 IMAGE_REMOVED = "(older camera image removed)"
-CHECK_PROMPT = """Before finishing, check the request once more: "{request}"
-Done so far:
+SCENE_MARK = "Scene now:"  # how every scene list starts (Toolbox._scene_text, PLAN_PROMPT)
+SCENE_REMOVED = "(older scene list removed; use the latest one)"
+CHECK_PROMPT = """Before finishing, check the request once more against what the camera shows now: "{request}"
+Actions so far (what the tools reported; an object can still slip or fall, so trust the views and the scene list):
 {done}
-Is every part of the request done? If yes, call finish again. If not, do the missing part now."""
+
+{scene}
+
+Look at the new views and the scene list. Is every part of the request done there? If yes, call finish again. If not, do the missing part now."""
+STEP_CHECK_PROMPT = """After this step the robot looked at the table again (centre view).
+{scene}
+
+Request: "{request}"
+Compare the new views and scene list with the request: what is done, and what is still missing or went wrong? Then call the next tool."""
 ACTION_TOOLS = ("pick_up", "place_at", "move_gripper")
 
 
@@ -97,7 +113,8 @@ def _load_image(path: Path, max_side: int = 960) -> np.ndarray | None:
 
 @dataclass
 class Conversation:
-    """Chat history, keeping only the newest image."""
+    """Chat history, keeping only the newest image and the newest scene list: with a look after every
+    action, keeping them all grows the context until the model runs out of GPU memory."""
     messages: list[Message] = field(default_factory=list)
 
     def add(self, role: str, text: str, image: Path | None = None, tool_call: ToolCall | None = None) -> None:
@@ -106,7 +123,19 @@ class Conversation:
             for msg in self.messages:  # drop older images
                 if msg.image is not None:
                     msg.image, msg.text = None, f"{IMAGE_REMOVED} {msg.text}"
+        if SCENE_MARK in text:
+            for msg in self.messages:  # drop older scene lists
+                msg.text = _drop_scene(msg.text)
         self.messages.append(Message(role, text, rgb, tool_call))
+
+
+def _drop_scene(text: str) -> str:
+    """The text with its scene list ("Scene now:" up to the next blank line) replaced by a note."""
+    i = text.find(SCENE_MARK)
+    if i < 0:
+        return text
+    j = text.find("\n\n", i)
+    return text[:i] + SCENE_REMOVED + (text[j:] if j >= 0 else "")
 
     def transcript(self) -> list[dict]:
         return [{"role": m.role, "text": m.text,
@@ -158,12 +187,12 @@ class Agent:
                 if getattr(arm, "stop_event", None) is not None and arm.stop_event.is_set():
                     raise MotionStopped("stopped by user")
 
-            s.begin("home", sk.rest)
+            s.begin("home", sk.scan)
             sk.home()
             s.rep.step("home", "done")
 
             s.begin("look")
-            res = tb.call("look_around", {}, "look")
+            res = look = tb.check_scene("look")  # one view; look_around (three views) is the model's tool
             s.rep.step("look", "done" if res.ok else "failed", res.text.split("\n")[0], images=[res.image] if res.image else None)
             check_stop()
 
@@ -201,6 +230,7 @@ class Agent:
 
             failed: dict[tuple, int] = {}  # (tool, args) -> failures, to stop the model repeating itself
             checked = False  # the completion check was shown
+            fresh: ToolResult | None = look if look.ok else None  # the last look at the table, until the robot acts
             for n in range(1, self.cfg.max_steps + 1):
                 check_stop()
                 if time.monotonic() - t0 > self.cfg.max_time_s:
@@ -232,13 +262,17 @@ class Agent:
                 if call.name == "finish" and not checked and _truthy(call.args.get("success")):
                     checked = True
                     done = [f"- {c['name']}({', '.join(f'{k}={v}' for k, v in c['args'].items())}): "
-                            f"{c['result'].splitlines()[0]}" for c in calls if c.get("ok") and c.get("name") in ACTION_TOOLS]
-                    res = ToolResult(False, CHECK_PROMPT.format(request=request, done="\n".join(done) or "- nothing yet"))
+                            f"{c['result'].splitlines()[0]}" for c in calls if c.get("name") in ACTION_TOOLS]
+                    look = fresh if fresh is not None else tb.check_scene(f"{sid}.check")
+                    scene_now = look.text if look.ok else f"(Could not look around again: {look.text})"
+                    res = ToolResult(False, CHECK_PROMPT.format(request=request, done="\n".join(done) or "- nothing yet",
+                                                                scene=scene_now), look.image if look.ok else None)
                     calls.append({"n": n, "name": call.name, "args": call.args, "thought": call.thought,
                                   "ok": False, "result": "completion check", "thinking_s": round(dt, 1),
                                   "tokens": reply.tokens})
-                    s.rep.step(sid, "done", "check: is every part of the request done?")
-                    conv.add("tool", res.text, None)
+                    s.rep.step(sid, "done", "check: is every part of the request done?", None,
+                               [res.image] if res.image else None)
+                    conv.add("tool", res.text, res.image)
                     reasoning(s.rep, "check", res.text)
                     continue
                 if failed.get(key, 0) >= 2 and call.name != "finish":
@@ -261,7 +295,19 @@ class Agent:
                     log["result"] = ("done: " if res.ok else "failed: ") + (res.text or "-")
                     reasoning(s.rep, "finished", log["result"])
                     return
-                conv.add("tool", ("OK. " if res.ok else "FAILED. ") + res.text, res.image)
+                text, image = ("OK. " if res.ok else "FAILED. ") + res.text, res.image
+                if call.name in ACTION_TOOLS:  # the world may have changed: see it again, as before planning
+                    check_stop()
+                    fresh = tb.check_scene(f"{sid}.check")
+                    if fresh.ok:
+                        text += "\n\n" + STEP_CHECK_PROMPT.format(scene=fresh.text, request=request)
+                        image = fresh.image or image
+                    else:
+                        text += f"\n\n(Looking around again after this step failed: {fresh.text})"
+                        fresh = None
+                elif call.name == "look_around" and res.ok:
+                    fresh = res
+                conv.add("tool", text, image)
                 reasoning(s.rep, "result", ("OK. " if res.ok else "FAILED. ") + res.text.split("\nScene now:")[0])
             log["result"] = f"gave up: used all {self.cfg.max_steps} steps"
 

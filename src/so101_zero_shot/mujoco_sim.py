@@ -15,6 +15,7 @@ Differences from the real setup worth knowing:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -36,6 +37,21 @@ from .perception.gripper_mask import set_pinhole_camera  # noqa: E402
 log = logging.getLogger(__name__)
 
 SIM_SCENE_PATH = ASSETS_DIR / "sim_scene.xml"
+YCB_DIR = ASSETS_DIR / "ycb"  # scanned household objects (assets/so101/make_ycb.py); optional
+# Objects not in use wait out of every camera's view, behind the robot, on a grid this far apart.
+PARK_ORIGIN_XY, PARK_STEP_M, PARK_COLS = (-0.9, -0.75), 0.3, 6
+# Extra objects built into the sim (besides the scene file's and the YCB ones). Parked until a scene uses them.
+TOWER_BLOCKS = {"block_large": 0.020, "block_medium": 0.016, "block_small": 0.012}  # cube half sizes (m)
+PLATE = ("plate", 0.075, 0.006)  # name, radius, half height (m)
+# Colours a scene can give the tower blocks (RGBA): distinct, named in nothing, so any can be used.
+BLOCK_COLORS = [(0.85, 0.12, 0.10), (0.12, 0.30, 0.85), (0.95, 0.80, 0.10), (0.15, 0.65, 0.25), (0.55, 0.20, 0.70),
+                (0.95, 0.50, 0.10), (0.10, 0.70, 0.75), (0.90, 0.40, 0.60)]
+# Table looks a scene can use: (rgb1, rgb2, mark) of a faint 5 cm checker, like the scene file's wood.
+TABLE_LOOKS = [((0.56, 0.40, 0.27), (0.52, 0.37, 0.25), (0.47, 0.33, 0.22)),  # wood (the scene file's)
+               ((0.62, 0.62, 0.60), (0.58, 0.58, 0.56), (0.50, 0.50, 0.48)),  # grey
+               ((0.80, 0.78, 0.72), (0.76, 0.74, 0.68), (0.68, 0.66, 0.60)),  # light
+               ((0.35, 0.25, 0.18), (0.32, 0.23, 0.16), (0.27, 0.19, 0.13)),  # dark wood
+               ((0.30, 0.40, 0.33), (0.28, 0.37, 0.30), (0.24, 0.32, 0.26))]  # green mat
 STOP_MARGIN_DEG = 4.0  # soft limits are the calibrated range minus this; the sim joint range is the full range
 OBJECT_GAP_M = 0.005  # shifted objects (reset with jitter) keep at least this much space between them
 _ARM_CONTYPE, _WORLD_CONTYPE = 2, 1  # arm geoms collide with the world (table, objects), not each other
@@ -46,6 +62,63 @@ _FINGER_PADS = {
     "clamp_right": ((0.05865, 0.10575, 0.18600), (0.00625, 0.01745, 0.01480)),
     "clamp_left": ((-0.07850, 0.10795, 0.18355), (0.00630, 0.01745, 0.01485)),
 }
+
+
+def park_xy(i: int) -> tuple[float, float]:
+    """The i-th parking spot (out of view behind the robot)."""
+    return PARK_ORIGIN_XY[0] - PARK_STEP_M * (i // PARK_COLS), PARK_ORIGIN_XY[1] + PARK_STEP_M * (i % PARK_COLS)
+
+
+def _ycb_manifest() -> dict:
+    path = YCB_DIR / "manifest.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _add_object_pool(spec: mujoco.MjSpec) -> None:
+    """Add the objects scenes can use (YCB scans, tower blocks, a plate) and the extra table looks. They
+    start parked; SimWorld.arrange puts a scene's objects on the table. Without assets/so101/ycb only the
+    blocks and the plate are added."""
+    def material(name, rgba=(1, 1, 1, 1), texture=None, **kw):
+        mat = spec.add_material(name=name, rgba=list(rgba), **kw)
+        if texture:
+            mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = texture
+        return mat
+
+    def body(name, x, y, z):
+        b = spec.worldbody.add_body(name=name, pos=[x, y, z])
+        b.add_freejoint()
+        return b
+
+    obj = {"friction": [1.5, 0.02, 0.002], "condim": 4, "solref": [0.004, 1]}
+    for i, (rgb1, rgb2, mark) in enumerate(TABLE_LOOKS):
+        spec.add_texture(name=f"table_look{i}", type=mujoco.mjtTexture.mjTEXTURE_2D,
+                         builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, mark=mujoco.mjtMark.mjMARK_EDGE,
+                         rgb1=list(rgb1), rgb2=list(rgb2), markrgb=list(mark), width=400, height=400)
+        material(f"table_look{i}", texture=f"table_look{i}", texuniform=True, texrepeat=[20, 20])
+    slot = iter(range(10_000))
+
+    def park():
+        return park_xy(next(slot))
+
+    for key, info in _ycb_manifest().items():
+        d = YCB_DIR / key
+        if not (d / "mesh.obj").exists():
+            continue
+        spec.add_texture(name=f"{key}_tex", type=mujoco.mjtTexture.mjTEXTURE_2D, file=str(d / "texture.png"))
+        material(f"{key}_mat", texture=f"{key}_tex", specular=0.2)
+        spec.add_mesh(name=f"{key}_mesh", file=str(d / "mesh.obj"))
+        b = body(key, *park(), 0.0005)  # the mesh's base is at its origin
+        b.add_geom(type=mujoco.mjtGeom.mjGEOM_MESH, meshname=f"{key}_mesh", material=f"{key}_mat",
+                   mass=float(info["mass_kg"]), **obj)
+    for name, half in TOWER_BLOCKS.items():
+        material(f"{name}_mat", rgba=(*BLOCK_COLORS[len(spec.materials) % len(BLOCK_COLORS)], 1))
+        b = body(name, *park(), half)
+        b.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[half] * 3, material=f"{name}_mat",
+                   mass=float(600 * (2 * half) ** 3), **obj)  # wood
+    name, r, hh = PLATE
+    material("plate_mat", rgba=(0.95, 0.95, 0.93, 1), specular=0.3)
+    b = body(name, *park(), hh)
+    b.add_geom(type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[r, hh, 0], material="plate_mat", mass=0.25, **obj)
 
 
 class SimWorld:
@@ -93,7 +166,19 @@ class SimWorld:
         # Ground truth for tests and the benchmark, updated every physics step (see track()).
         self.max_z: dict[str, float] = {}
         self.hand_contact_n = 0.0  # largest arm-hand contact force since the last reset_tracking()
-        self._home = self.data.qpos.copy()  # object layout from the XML
+        self._home = self.data.qpos.copy()  # object layout from the XML (pool objects parked)
+        self._adr = {n: int(m.jnt_qposadr[m.body(n).jntadr[0]]) for n in self._objects}
+        self._on_table = [n for n in self._objects if self._home[self._adr[n]] > 0]  # the scene file's layout
+        self._footprints: dict[str, tuple[np.ndarray, float]] = {}  # (outline, height), see footprint_xy
+        # Parking: pool objects where they were built (already parked); the scene file's objects after them.
+        spare = iter(range(len(self._objects) - len(self._on_table), 10_000))
+        self._park = {n: park_xy(next(spare)) if n in self._on_table else tuple(self._home[self._adr[n]:self._adr[n] + 2])
+                      for n in self._objects}
+        self.labels = {n: n.replace("_", " ") for n in self._objects}  # what each object is called in requests
+        self.labels.update({k: v["label"] for k, v in _ycb_manifest().items() if k in self._adr})
+        self._look_defaults = (m.light_diffuse.copy(), m.light_pos.copy(), m.light_dir.copy(),
+                               m.vis.headlight.ambient.copy(), m.vis.headlight.diffuse.copy(),
+                               int(m.geom_matid[m.geom("floor").id]))
         self.torque = False
         self.reset()
 
@@ -115,6 +200,7 @@ class SimWorld:
                     g.contype = g.conaffinity = 0
             body.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=list(half), pos=list(centre), group=3,
                           friction=[1.5, 0.02, 0.002], condim=4, contype=1, conaffinity=1)
+        _add_object_pool(spec)
         return spec.compile()
 
     def _widen_joint_ranges(self) -> None:
@@ -173,7 +259,8 @@ class SimWorld:
         with self._lock:
             mujoco.mj_resetData(self.model, self.data)
             self.data.qpos[:] = self._home
-            adrs = [int(self.model.jnt_qposadr[self.model.body(n).jntadr[0]]) for n in self._objects]
+            adrs = [self._adr[n] for n in self._on_table]  # parked objects stay parked
+            radius = np.array([self._radius_xy[self._objects.index(n)] for n in self._on_table])
             for _ in range(100):  # redraw shifts that make objects overlap (physics would throw them apart)
                 self.data.qpos[:] = self._home
                 for adr in adrs:
@@ -185,7 +272,7 @@ class SimWorld:
                                            self.data.qpos[adr + 3:adr + 7].copy())
                         self.data.qpos[adr + 3:adr + 7] = q
                 xy = np.array([self.data.qpos[a:a + 2] for a in adrs])
-                gap = np.linalg.norm(xy[:, None] - xy[None], axis=-1) - self._radius_xy[:, None] - self._radius_xy[None]
+                gap = np.linalg.norm(xy[:, None] - xy[None], axis=-1) - radius[:, None] - radius[None]
                 if jitter_m <= 0 or (gap + np.eye(len(adrs)) * 1.0).min() >= OBJECT_GAP_M:
                     break
             for j, q in zip(ARM_JOINTS, self.cfg.poses["rest"]):
@@ -236,6 +323,82 @@ class SimWorld:
             dadr = int(self.model.jnt_dofadr[self.model.body(name).jntadr[0]])
             self.data.qvel[dadr:dadr + 6] = 0.0
             mujoco.mj_forward(self.model, self.data)
+
+    @property
+    def objects(self) -> list[str]:
+        """Every movable object in the sim (on the table or parked)."""
+        return list(self._objects)
+
+    def radius_xy(self, name: str) -> float:
+        """Top-view radius (m) of an object, for laying out scenes without overlaps."""
+        return float(self._radius_xy[self._objects.index(name)])
+
+    def footprint_xy(self, name: str) -> np.ndarray:
+        """(N, 2) convex outline (m) of an object seen from above, resting in its home pose at yaw 0, around
+        its body origin: for laying out scenes without overlaps."""
+        if name not in self._footprints:
+            m, pts = self.model, []
+            for g in range(m.ngeom):
+                if m.geom_bodyid[g] != m.body(name).id:
+                    continue
+                t, size = m.geom_type[g], m.geom_size[g]
+                if t == mujoco.mjtGeom.mjGEOM_MESH:
+                    mid = m.geom_dataid[g]
+                    local = m.mesh_vert[m.mesh_vertadr[mid]:m.mesh_vertadr[mid] + m.mesh_vertnum[mid]]
+                elif t == mujoco.mjtGeom.mjGEOM_BOX:
+                    local = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]) * size
+                else:  # sphere, cylinder, capsule: a circle of radius size[0] at both ends of the axis
+                    a = np.linspace(0, 2 * np.pi, 16, endpoint=False)
+                    half = 0.0 if t == mujoco.mjtGeom.mjGEOM_SPHERE else size[1]
+                    ring = np.stack([size[0] * np.cos(a), size[0] * np.sin(a)], 1)
+                    local = np.vstack([np.c_[ring, np.full(16, z)] for z in (-half, half)])
+                R = np.empty(9)
+                mujoco.mju_quat2Mat(R, m.geom_quat[g])
+                pts.append(local @ R.reshape(3, 3).T + m.geom_pos[g])
+            R = np.empty(9)
+            mujoco.mju_quat2Mat(R, self._home[self._adr[name] + 3:self._adr[name] + 7])
+            pts = np.vstack(pts) @ R.reshape(3, 3).T
+            hull = cv2.convexHull(pts[:, :2].astype(np.float32)).reshape(-1, 2).astype(float)
+            self._footprints[name] = (hull, float(np.ptp(pts[:, 2])))
+        return self._footprints[name][0]
+
+    def height_m(self, name: str) -> float:
+        """Height (m) of an object resting in its home pose."""
+        self.footprint_xy(name)
+        return self._footprints[name][1]
+
+    def arrange(self, placements: dict[str, tuple[float, float, float]]) -> None:
+        """Lay out a scene: each named object at (x, y, yaw deg) on the table, resting as in its home pose;
+        every other object parked out of view."""
+        unknown = set(placements) - set(self._objects)
+        if unknown:
+            raise ValueError(f"no objects {sorted(unknown)}; objects: {self._objects}")
+        with self._lock:
+            for n in self._objects:
+                x, y, yaw = placements.get(n, (*self._park[n], 0.0))
+                self.set_object(n, [x, y, self._home[self._adr[n] + 2]], yaw)
+
+    def randomize_look(self, rng: np.random.Generator | None) -> None:
+        """Lighting (strength, direction), table colour and tower-block colours from `rng`; None = the scene
+        file's look. Rendering cost is unchanged (no shadows, same textures)."""
+        m = self.model
+        diffuse, pos, direction, ambient, head, floor_mat = self._look_defaults
+        with self._lock:
+            m.light_diffuse[:], m.light_pos[:], m.light_dir[:] = diffuse, pos, direction
+            m.vis.headlight.ambient[:], m.vis.headlight.diffuse[:] = ambient, head
+            m.geom_matid[m.geom("floor").id] = floor_mat
+            if rng is None:
+                return
+            m.light_diffuse[:] = diffuse * rng.uniform(0.6, 1.4, (len(diffuse), 1))
+            m.light_pos[:] = pos + rng.uniform(-0.4, 0.4, pos.shape) * [1, 1, 0]
+            d = direction + rng.uniform(-0.3, 0.3, direction.shape) * [1, 1, 0]
+            m.light_dir[:] = d / np.linalg.norm(d, axis=1, keepdims=True)
+            k = rng.uniform(0.75, 1.25)
+            m.vis.headlight.ambient[:], m.vis.headlight.diffuse[:] = ambient * k, head * k
+            looks = [m.material(f"table_look{i}").id for i in range(len(TABLE_LOOKS))]
+            m.geom_matid[m.geom("floor").id] = looks[int(rng.integers(len(looks)))]
+            for name, c in zip(TOWER_BLOCKS, rng.choice(len(BLOCK_COLORS), len(TOWER_BLOCKS), replace=False)):
+                m.mat_rgba[m.material(f"{name}_mat").id][:3] = BLOCK_COLORS[c]
 
     def reset_tracking(self) -> None:
         with self._lock:
@@ -583,7 +746,8 @@ class SimVideo:
         raw = self.path.with_suffix(".raw.mp4")
         writer = None
         try:
-            r = LiveRenderer(size=self.size, open_gap_m=self.world.open_gap_m, scene_path=SIM_SCENE_PATH)
+            with self.world._lock:  # the scene as it is now (objects in use, randomized look)
+                r = LiveRenderer(size=self.size, open_gap_m=self.world.open_gap_m, model=self.world.model)
             r.cam.lookat[:] = self.LOOKAT
             r.cam.distance, r.cam.azimuth, r.cam.elevation = self.DISTANCE, self.AZIMUTH, self.ELEVATION
             writer = cv2.VideoWriter(str(raw), cv2.VideoWriter_fourcc(*"mp4v"), self.fps * self.speedup, self.size)

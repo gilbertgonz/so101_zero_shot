@@ -30,6 +30,9 @@ MAX_MASK_FRAC = 0.25  # a "mask" bigger than this is the table / background, not
 # above which the mask is the gripper itself, not an object.
 MAX_ON_GRIPPER_FRAC = 0.5
 GRIPPER_GROW_PX = 6
+# While holding: depth readings within HELD_RADIUS_M of the fingertip's line of sight and less than HELD_DEPTH_M
+# beyond the fingertip are the held object (it hangs between and below the fingers), not the scene.
+HELD_RADIUS_M, HELD_DEPTH_M = 0.06, 0.08
 
 
 class PointerModel(Protocol):
@@ -97,6 +100,10 @@ class Locator:
         self.table_z_m = table_z_m
         self.gripper_mask = gripper_mask
         self.scene_map = None  # SceneMap: when set, every photo's depth is fused into it (Skills sets one per run)
+        # The gripper holds something (Skills.look sets it): its pixels are left out of the scene map, or the
+        # held object would be mapped as an obstacle floating in front of the camera.
+        self.holding = False
+        self._tip_cam: np.ndarray | None = None  # the fingertip point in the camera frame (fixed: both on the wrist)
         if gripper_mask is None:
             logger.warning("Locator without a gripper mask: masks on the robot's own fingers are not rejected")
 
@@ -180,6 +187,16 @@ class Locator:
             self._fuse(Z, rgb, T, gripper_pct)
         return Z
 
+    def _near_held(self, Z: np.ndarray) -> np.ndarray:
+        """Pixels whose depth puts them where a held object is: in a zone around the fingertips, which sit at
+        a fixed point in the camera frame (camera and fingers are both on the wrist)."""
+        if self._tip_cam is None:
+            q = np.zeros(5)
+            self._tip_cam = (np.linalg.inv(self.cam.pose_in_base(self.kin, q)) @ self.kin.fk(q)[:, 3])[:3]
+        P = self.rays * np.nan_to_num(Z, nan=np.inf)[..., None]  # camera frame
+        lateral = np.linalg.norm(P[..., :2] - self._tip_cam[:2], axis=-1)
+        return (P[..., 2] < self._tip_cam[2] + HELD_DEPTH_M) & (lateral < HELD_RADIUS_M)
+
     def _fuse(self, Z: np.ndarray, rgb: np.ndarray, T: np.ndarray, gripper_pct: float) -> None:
         """Add this photo's depth to the scene map, leaving out the robot's own gripper and the black border
         of the rectified image."""
@@ -188,6 +205,8 @@ class Locator:
             g = self.gripper_mask.mask(gripper_pct)
             k = 4 * GRIPPER_GROW_PX + 1
             valid &= cv2.dilate(g.astype(np.uint8), np.ones((k, k), np.uint8)) == 0
+        if self.holding:
+            valid &= ~self._near_held(Z)
         try:
             self.scene_map.integrate(Z, self.rect.K, T, rgb, valid)
         except Exception:  # noqa: BLE001 - the map is extra; measuring must not fail because of it

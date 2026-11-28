@@ -405,8 +405,9 @@ class Backend:
 
         try:
             if self.sim:  # show the simulation itself: arm and objects
-                from ..mujoco_sim import SIM_SCENE_PATH
-                r = LiveRenderer(size=(480, 360), open_gap_m=self.cfg.gripper_open_gap_m, scene_path=SIM_SCENE_PATH)
+                while self.world is None and self._running:  # started by the hardware thread
+                    time.sleep(0.1)
+                r = LiveRenderer(size=(480, 360), open_gap_m=self.cfg.gripper_open_gap_m, model=self.world.model)
             else:
                 r = LiveRenderer(size=(480, 360), open_gap_m=self.cfg.gripper_open_gap_m)
         except Exception as e:  # noqa: BLE001

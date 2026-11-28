@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 MERGE_DIST_M = 0.035  # same kind, centres closer than this (or inside each other's footprint) = same thing
 MAX_RANGE_M = 0.60  # measured centres further than this from the base are depth errors / background
+SIGHT_MARGIN = 0.08  # share of the image width / height near the edge that does not count as "in sight"
+SIGHT_GRIPPER_PX = 40  # ... nor this close to the gripper in the image (a held object hangs below it)
 HAND_COVER_GROW_M = 0.01  # a hand's footprint is grown by this when checking what it covers
 COLORS = {"red", "orange", "yellow", "green", "blue", "purple", "violet", "pink", "black", "white", "gray", "grey",
           "brown", "silver", "gold", "beige", "tan", "cyan", "teal", "navy", "maroon"}
@@ -125,6 +127,7 @@ class View:
     failures: list[str]
     detections: list[str] = field(default_factory=list)  # what the VLM listed, for debugging
     marked_bgr: np.ndarray | None = None
+    gripper_pct: float = 0.0
 
 
 class Scene:
@@ -166,6 +169,38 @@ class Scene:
     def forget(self, ref) -> None:
         o = self.get(ref)
         (self.hands if o.kind == "hand" else self.objects).pop(o.id, None)
+
+    def prune_unseen(self, since_view: int, views: list[View]) -> list[str]:
+        """Forget objects (not the held one) that one of `views` (the looks after view number `since_view`)
+        could see clearly where the list has them, yet none of those looks found: they were moved, dropped or
+        knocked away. Objects no view had in sight keep their last place. Returns the names forgotten."""
+        gone = [o for o in self.objects.values()
+                if not o.held and o.view <= since_view and any(self.in_sight(o.center_m, v) for v in views)]
+        for o in gone:
+            self.objects.pop(o.id, None)
+        return [o.name for o in gone]
+
+    def in_sight(self, point_m: np.ndarray, view: View) -> bool:
+        """Would this view show the point (base frame, m)? Inside the image with a margin (detection is
+        unreliable at the edge) and not behind the robot's own gripper."""
+        T = self.locator.cam.pose_in_base(self.locator.kin, view.joints_deg)
+        c = np.linalg.inv(T) @ np.append(point_m, 1.0)
+        if c[2] <= 0.02:
+            return False
+        K = self.locator.rect.K
+        u, v = (K[:2, :2] @ (c[:2] / c[2]) + K[:2, 2]).round().astype(int)
+        h, w = view.rect_bgr.shape[:2]
+        mx, my = round(SIGHT_MARGIN * w), round(SIGHT_MARGIN * h)
+        if not (mx <= u < w - mx and my <= v < h - my):
+            return False
+        gm = self.locator.gripper_mask
+        if gm is not None:
+            g = gm.mask(view.gripper_pct)
+            if g.shape == (h, w):
+                r = SIGHT_GRIPPER_PX
+                if g[max(0, v - r):v + r + 1, max(0, u - r):u + r + 1].any():
+                    return False
+        return True
 
     def held_object(self) -> SceneObject | None:
         return next((o for o in self.objects.values() if o.held), None)
@@ -318,7 +353,7 @@ class Scene:
                     masks.append(est.mask)
         self._hand_cover()
         view = View(self.views, np.asarray(joints_deg).copy(), rect_bgr, seen, masks, failures,
-                    [f"{k}: {d.label}" for k, d in dets])
+                    [f"{k}: {d.label}" for k, d in dets], gripper_pct=gripper_pct)
         view.marked_bgr = draw_marks(rect_bgr, seen, masks)
         self.last_view = view
         for f in failures:

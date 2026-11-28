@@ -87,4 +87,4 @@ perception:
 agent:
   # Reasoning model: backend:model[@options] (see agent/reasoner.py). Same as perception.vlm_model and
   # vlm_quantization here, so one copy is loaded.
-  reasoner: hf:Qwen/Qwen3-VL-4B-Instruct@4bit
+  reasoner: hf:Qwen/Qwen3-VL-8B-Instruct@4bit

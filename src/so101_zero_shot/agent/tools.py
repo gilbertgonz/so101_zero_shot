@@ -28,7 +28,7 @@ LOOK_AROUND = (("centre", 0.0), ("left", -30.0), ("right", 30.0))
 # Look-around views tilt the wrist this much further down than the scan pose: at the scan pose the gripper
 # jaw hides the table closest to the robot (x below about 20 cm), where the closest object usually is.
 LOOK_TILT_DEG = 12.0
-MAX_LOOK_AROUNDS = 3  # including the one before planning; more finds nothing new in a still scene
+MAX_LOOK_AROUNDS = 2  # the model's own three-view looks; more finds nothing new in a still scene
 MAX_WAYPOINTS = 12
 PATH_SHORT_M = 0.015  # ending further than this from the last point = blocked on the way
 HAND_NEAR_M = 0.12  # a gripper path this close to a seen hand asks the person first
@@ -59,7 +59,7 @@ TOOL_SPECS = [
         {"waypoints": {"type": "array", "description": "e.g. [[20, 0, 10], [25, 0, 10]]",
                        "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}},
          "gripper": {"type": "string", "enum": ["open", "close"]}}, ["waypoints"]),
-    _fn("go_home", "Move the arm back to its rest pose."),
+    _fn("go_home", "Move the arm back to its home pose, above the table with the camera looking at it."),
     _fn("finish", "End the task: say whether it was done and give a short message for the person.",
         {"success": {"type": "boolean"}, "message": {"type": "string"}}, ["success", "message"]),
 ]
@@ -116,6 +116,9 @@ class Toolbox:
         fn = getattr(self, f"t_{name}", None)
         if name not in TOOL_NAMES or fn is None:
             return ToolResult(False, f"unknown tool {name!r}; tools: {', '.join(TOOL_NAMES)}")
+        return self._run(fn, args, step_id, name)
+
+    def _run(self, fn, args: dict, step_id: str, name: str = "") -> ToolResult:
         rep = self.s.rep
         sub = self.s.rep = _Prefixed(rep, step_id)
         try:
@@ -168,22 +171,42 @@ class Toolbox:
                                      "anything new. Whatever is still not in the scene list is not on the table: "
                                      "call finish with success false and say so.")
         self.look_arounds += 1
+        return self._look_around()
+
+    def check_scene(self, step_id: str) -> ToolResult:
+        """Check the gripper, then look at the table from the centre view only (before planning, after an
+        action, before accepting finish): the scene list is updated from what is seen now, and what that view
+        should have seen but did not is dropped. About a third of a look around; not counted against the
+        model's look_around budget."""
+        dropped = self.check_grip()
+        res = self._run(self._look_around, {"sides": LOOK_AROUND[:1]}, step_id)
+        if dropped:
+            res.text = dropped + "\n" + res.text
+        return res
+
+    def _look_around(self, sides=LOOK_AROUND) -> ToolResult:
         held = self.scene.held_object()
-        panels, seen, failures = {}, [], []
-        for side, pan in LOOK_AROUND:
+        since = self.scene.views
+        panels, seen, views = [], [], []
+        for side, pan in sides:
             view, _ = self._look(self.sk.scan + np.array([pan, 0, 0, LOOK_TILT_DEG, 0]), "look")
-            panels[side] = cv2.resize(view.marked_bgr, (640, 480))
+            panels.append((side, cv2.resize(view.marked_bgr, (640, 480))))
             seen += [o.name for o in view.objects if o.name not in seen]
-            failures += view.failures
+            views.append(view)
         if held is not None:
             held.held = True
-        mosaic = np.hstack([panels["left"], panels["centre"], panels["right"]])
-        for i, t in enumerate(("left", "centre", "right")):
+        gone = self.scene.prune_unseen(since, views)
+        order = [p for name in ("left", "centre", "right") for p in panels if p[0] == name]
+        mosaic = np.hstack([img for _, img in order])
+        for i, (t, _) in enumerate(order):
             cv2.putText(mosaic, t, (i * 640 + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
         path = self.s.out / f"look_around{self._views}.jpg"
         cv2.imwrite(str(path), mosaic)
-        return ToolResult(True, f"Looked left, centre and right; saw {', '.join(seen) or 'nothing'}.\n"
-                          + self._scene_text(), path, detail={"seen": seen})
+        text = (f"Looked {', '.join(t for t, _ in order).replace(', right', ' and right')}; "
+                f"saw {', '.join(seen) or 'nothing'}.")
+        if gone:
+            text += f" No longer seen where they were (moved, dropped or knocked away): {', '.join(gone)}."
+        return ToolResult(True, text + "\n" + self._scene_text(), path, detail={"seen": seen, "gone": gone})
 
     def t_look_at(self, id) -> ToolResult:
         o = self._obj(id)
@@ -224,6 +247,23 @@ class Toolbox:
         except KeyError:
             return None
 
+    def check_grip(self) -> str:
+        """Is the object the robot thinks it holds still in the gripper? Read from the gripper itself (finger
+        opening and squeeze force), not from memory: an object can slip out while the arm moves. If it is
+        gone, the robot stops treating it as held, forgets where it was (it is listed again once seen) and
+        returns a note for the model; "" when nothing changed."""
+        if self.sk.held is None or self.picked_id is None:
+            return ""
+        if self.sk.grip().squeezing:
+            return ""
+        h = self._held_obj()
+        what = f"{self.picked_id} ({h.label})" if h is not None else self.picked_id
+        logger.warning("gripper empty: %s slipped out", what)
+        self.sk.held = None
+        self._after_release(None)
+        return (f"The gripper is empty: {what} slipped out of it (the fingers closed on nothing). It probably fell "
+                "onto the table near where the gripper was; it is out of the scene list until it is seen again.")
+
     def _after_release(self, where_m: np.ndarray | None) -> None:
         if self.picked_id is not None:
             try:
@@ -237,6 +277,9 @@ class Toolbox:
         self.picked_id = None
 
     def t_place_at(self, x_cm, y_cm) -> ToolResult:
+        dropped = self.check_grip()
+        if dropped:
+            return ToolResult(False, dropped)
         if self.sk.held is None:
             return ToolResult(False, "not holding anything")
         xy = np.array([float(x_cm), float(y_cm)]) / 100.0
@@ -321,17 +364,19 @@ class Toolbox:
         if gripper == "open" and held is not None:
             self._after_release(None)
             text += f" Opened the gripper and let go of {held}; look around to see where it landed."
+        elif held is not None and self.sk.held is not None and (dropped := self.check_grip()):
+            text += " " + dropped
         elif gripper == "close" and held is not None:
-            text += f" Still holding {held} (the gripper was already closed on it); opening it lets go."
+            text += f" Still holding {held} (checked: the gripper is squeezing it); opening it lets go."
         elif gripper:
             text += f" Gripper {'opened' if gripper == 'open' else 'closed'}."
         return ToolResult(True, text)
 
     def t_go_home(self) -> ToolResult:
-        self.s.begin("home", self.sk.rest)
-        self.sk.return_home(via_scan=True)
+        self.s.begin("home", self.sk.scan)
+        self.sk.go_home()
         self.s.rep.step("home", "done")
-        return ToolResult(True, "At the rest pose.")
+        return ToolResult(True, "At the home pose (above the table, looking at it).")
 
     def t_finish(self, success, message="") -> ToolResult:
         ok = success if isinstance(success, bool) else str(success).lower() in ("true", "yes", "1")
